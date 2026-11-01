@@ -1,0 +1,1348 @@
+# ==========================================================================
+#  生物科技ETF 量化终端 · Kaggle 一键启动(Cell 1)
+#  使用前提:Notebook 右侧 Settings → Internet 必须是 ON(行情和公网网址都需要联网)
+#  运行后:下方会打印一个 https://xxxx.trycloudflare.com 网址,点开就是量化终端
+#  说明:服务以后台进程运行,本单元运行完即返回;会话不关闭,网站就一直在线
+# ==========================================================================
+import os, sys, re, time, subprocess, urllib.request
+
+ROOT = os.environ.get("QUANT_ROOT", "/kaggle/working/quant")
+PORT = int(os.environ.get("QUANT_PORT", "8000"))
+os.makedirs(ROOT, exist_ok=True)
+
+SERVER_PY = r'''#!/usr/bin/env python3
+"""
+生物科技ETF 量化终端 - Kaggle / 本地 Python 版后端(零第三方依赖)
+
+与 Next.js 版(src/lib/quant/*)实现同一套接口:
+  GET  /               量化终端页面(index.html)
+  GET  /api/state      行情 + 指标 + 账户 + 持仓 + 胜率 + 最近成交(1 秒轮询)
+  GET  /api/trades     成交日志分页
+  POST /api/trade      模拟下单   {symbol, side, qty}
+  POST /api/auto       自动策略开关 {enabled}
+  POST /api/reset      重置账户(10000 元)
+  GET  /api/health     健康检查
+
+行情源:新浪(主) -> 腾讯(备);全部失败时才使用明确标注的"模拟行情"。
+存储:SQLite(默认 /kaggle/working/quant.db,否则当前目录)。
+"""
+import json
+import math
+import os
+import random
+import re
+import sqlite3
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# 前端单文件:Kaggle 单元把它与 server.py 放在同目录;GitHub 仓库里位于 public/terminal/
+INDEX_PATH = next(
+    (p for p in (os.path.join(HERE, "index.html"),
+                 os.path.join(HERE, "..", "public", "terminal", "index.html")) if os.path.exists(p)),
+    os.path.join(HERE, "index.html"),
+)
+DB_PATH = os.environ.get("QUANT_DB") or (
+    "/kaggle/working/quant.db" if os.path.isdir("/kaggle/working") else os.path.join(HERE, "quant.db")
+)
+PORT = int(os.environ.get("PORT", "8000"))
+
+# ----------------------------- 配置(与 config.ts 保持一致) -----------------------------
+SYMBOLS = [
+    {"code": "IBB", "name": "生物科技指数ETF-iShares Nasdaq", "short": "iShares Nasdaq Biotech", "market": "US",
+     "currency": "USD", "lot": 1, "decimals": 2, "sina": "gb_ibb", "tencent": "usIBB", "base": 217.6},
+    {"code": "XBI", "name": "美国生科ETF-SPDR", "short": "SPDR S&P Biotech", "market": "US",
+     "currency": "USD", "lot": 1, "decimals": 2, "sina": "gb_xbi", "tencent": "usXBI", "base": 156.0},
+    {"code": "159502", "name": "标普生物科技ETF嘉实", "short": "嘉实标普生物科技", "market": "CN",
+     "currency": "CNY", "lot": 100, "decimals": 3, "sina": "sz159502", "tencent": "sz159502", "base": 1.62},
+]
+INITIAL_CAPITAL = 10000.0
+FEE_RATE = 0.0003
+TICK_MAX = 1800
+POLL_S = 1.0
+DEFAULT_FX = 7.2
+MA_FAST, MA_SLOW, RSI_N, BOLL_N, BOLL_K = 30, 120, 60, 120, 2
+TAKE_PROFIT, STOP_LOSS = 0.012, 0.008
+AUTO_COOLDOWN_S, AUTO_CASH_FRACTION = 30.0, 0.5
+
+# ----------------------------- 时区 / 市场时段 -----------------------------
+CN_TZ = timezone(timedelta(hours=8))
+try:
+    from zoneinfo import ZoneInfo
+    US_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover
+    try:
+        from dateutil import tz as _tz
+        US_TZ = _tz.gettz("America/New_York") or timezone(timedelta(hours=-5))
+    except Exception:
+        US_TZ = timezone(timedelta(hours=-5))
+TZ = {"US": US_TZ, "CN": CN_TZ}
+STATE_LABEL = {"open": "交易中", "pre": "盘前", "post": "盘后", "lunch": "午休", "closed": "休市"}
+
+
+def market_state(market, now_s):
+    d = datetime.fromtimestamp(now_s, TZ[market])
+    if d.weekday() >= 5:
+        return "closed"
+    t = d.hour * 60 + d.minute
+    if market == "US":
+        if 570 <= t < 960:
+            return "open"
+        if 240 <= t < 570:
+            return "pre"
+        if 960 <= t < 1200:
+            return "post"
+        return "closed"
+    if 570 <= t < 690 or 780 <= t < 900:
+        return "open"
+    if 690 <= t < 780:
+        return "lunch"
+    if 555 <= t < 570:
+        return "pre"
+    return "closed"
+
+
+def zoned_ms(y, mo, d, hh, mi, ss, market):
+    return datetime(y, mo, d, hh, mi, ss, tzinfo=TZ[market]).timestamp() * 1000
+
+
+# ----------------------------- 行情源 -----------------------------
+def http_text(url, headers):
+    h = {"User-Agent": "Mozilla/5.0 (quant-terminal)"}
+    h.update(headers)
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=2.5) as r:
+        return r.read().decode("gb18030", "replace")
+
+
+def num(s):
+    try:
+        v = float(s)
+        return v if math.isfinite(v) else 0.0
+    except Exception:
+        return 0.0
+
+
+def parse_cn_time(date_s, time_s, fallback_ms):
+    try:
+        y, mo, d = [int(x) for x in date_s.split("-")]
+        hh, mi, ss = [int(x) for x in time_s.split(":")]
+        return zoned_ms(y, mo, d, hh, mi, ss, "CN")
+    except Exception:
+        return fallback_ms
+
+
+def fetch_sina():
+    lst = ",".join([s["sina"] for s in SYMBOLS] + ["fx_susdcny"])
+    text = http_text("https://hq.sinajs.cn/list=" + lst, {"Referer": "https://finance.sina.com.cn"})
+    mp = {}
+    for m in re.finditer(r'hq_str_(\w+)="([^"]*)"', text):
+        mp[m.group(1)] = m.group(2).split(",")
+    now_ms = time.time() * 1000
+    quotes = {}
+    for s in SYMBOLS:
+        f = mp.get(s["sina"])
+        if not f or len(f) < 10:
+            continue
+        if s["market"] == "US":
+            price = num(f[1])
+            prev = num(f[26]) if len(f) > 26 else 0
+            st = market_state("US", time.time())
+            ext = num(f[21]) if len(f) > 21 else 0
+            if st in ("pre", "post") and ext > 0:
+                price = ext
+            if price <= 0:
+                continue
+            try:
+                ds, ts = f[3].split(" ")
+                qt = parse_cn_time(ds, ts, now_ms)
+            except Exception:
+                qt = now_ms
+            quotes[s["code"]] = {"code": s["code"], "price": price, "prevClose": prev if prev > 0 else price,
+                                 "open": num(f[5]) or price, "high": num(f[6]) or price, "low": num(f[7]) or price,
+                                 "quoteTime": qt, "feed": "sina"}
+        else:
+            price = num(f[3])
+            prev = num(f[2])
+            if price <= 0:
+                price = prev
+            if price <= 0:
+                continue
+            quotes[s["code"]] = {"code": s["code"], "price": price, "prevClose": prev if prev > 0 else price,
+                                 "open": num(f[1]) or price, "high": num(f[4]) or price, "low": num(f[5]) or price,
+                                 "quoteTime": parse_cn_time(f[30], f[31], now_ms) if len(f) > 31 else now_ms,
+                                 "feed": "sina"}
+    fxr = mp.get("fx_susdcny")
+    fx = num(fxr[1]) if fxr and len(fxr) > 1 and num(fxr[1]) > 5 else None
+    return {"quotes": quotes, "fx": fx}
+
+
+def fetch_tencent():
+    text = http_text("https://qt.gtimg.cn/q=" + ",".join(s["tencent"] for s in SYMBOLS),
+                     {"Referer": "https://gu.qq.com"})
+    quotes = {}
+    now_ms = time.time() * 1000
+    for s in SYMBOLS:
+        m = re.search(r'v_%s="([^"]*)"' % re.escape(s["tencent"]), text)
+        if not m:
+            continue
+        f = m.group(1).split("~")
+        if len(f) < 35:
+            continue
+        price = num(f[3])
+        if price <= 0:
+            continue
+        ts = f[30]
+        qt = now_ms
+        a = re.match(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$", ts)
+        b = re.match(r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$", ts)
+        mm = a or b
+        if mm:
+            qt = zoned_ms(*[int(x) for x in mm.groups()], s["market"])
+        quotes[s["code"]] = {"code": s["code"], "price": price, "prevClose": num(f[4]) or price,
+                             "open": num(f[5]) or price, "high": num(f[33]) or price, "low": num(f[34]) or price,
+                             "quoteTime": qt, "feed": "tencent"}
+    return {"quotes": quotes, "fx": None}
+
+
+def fetch_yahoo_fx():
+    req = urllib.request.Request("https://query1.finance.yahoo.com/v8/finance/chart/CNY=X?interval=1m&range=1d",
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=2.5) as r:
+        j = json.loads(r.read().decode("utf-8"))
+    p = j["chart"]["result"][0]["meta"]["regularMarketPrice"]
+    return p if isinstance(p, (int, float)) and p > 5 else None
+
+
+# ----------------------------- 指标(与 indicators.ts 一致) -----------------------------
+def rsi_calc(prices, n):
+    if len(prices) < n + 1:
+        return None
+    w = prices[-(n + 1):]
+    up = dn = 0.0
+    for i in range(1, len(w)):
+        d = w[i] - w[i - 1]
+        if d > 0:
+            up += d
+        else:
+            dn -= d
+    if up + dn == 0:
+        return 50.0
+    return 100.0 * up / (up + dn)
+
+
+def analyze(prices):
+    sig = {"ready": False, "warm": len(prices), "need": MA_SLOW, "maFast": None, "maSlow": None, "rsi": None,
+           "bollUp": None, "bollMid": None, "bollLow": None, "score": 0, "action": "HOLD", "reasons": []}
+    if len(prices) < MA_SLOW:
+        return sig
+    last = prices[-1]
+    ma_fast = sum(prices[-MA_FAST:]) / MA_FAST
+    ma_slow = sum(prices[-MA_SLOW:]) / MA_SLOW
+    bw = prices[-BOLL_N:]
+    bm = sum(bw) / len(bw)
+    bs = math.sqrt(sum((v - bm) ** 2 for v in bw) / len(bw))
+    r = rsi_calc(prices, RSI_N)
+    sig.update(ready=True, maFast=ma_fast, maSlow=ma_slow, rsi=r, bollMid=bm,
+               bollUp=bm + BOLL_K * bs, bollLow=bm - BOLL_K * bs)
+    score = 0
+    rel = (ma_fast - ma_slow) / ma_slow
+    if rel > 0.0002:
+        score += 1
+        sig["reasons"].append("MA30 在 MA120 之上(趋势向上)")
+    elif rel < -0.0002:
+        score -= 1
+        sig["reasons"].append("MA30 在 MA120 之下(趋势向下)")
+    if r is not None:
+        if r < 30:
+            score += 1
+            sig["reasons"].append("RSI 超卖(<30)")
+        elif r > 70:
+            score -= 1
+            sig["reasons"].append("RSI 超买(>70)")
+    if bs > 0:
+        if last < sig["bollLow"]:
+            score += 1
+            sig["reasons"].append("价格跌破布林下轨")
+        elif last > sig["bollUp"]:
+            score -= 1
+            sig["reasons"].append("价格突破布林上轨")
+    sig["score"] = score
+    sig["action"] = "BUY" if score >= 2 else ("SELL" if score <= -1 else "HOLD")
+    return sig
+
+
+# ----------------------------- 状态 / 数据库 -----------------------------
+LOCK = threading.RLock()
+E = {
+    "epoch": int(time.time() * 1000), "ticks": {}, "quotes": {}, "signals": {},
+    "fx": {"rate": DEFAULT_FX, "src": "default", "at": 0},
+    "feed": {"name": "-", "ok": False, "latency": 0, "lastOkAt": 0, "error": "starting"},
+    "auto": False, "last_auto": {},
+}
+DB = sqlite3.connect(DB_PATH, check_same_thread=False)
+DB.row_factory = sqlite3.Row
+
+
+def r2(v):
+    return math.floor(v * 100 + 0.5) / 100
+
+
+def r4(v):
+    return math.floor(v * 10000 + 0.5) / 10000
+
+
+def init_db():
+    with LOCK:
+        DB.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS account(id INTEGER PRIMARY KEY, cash REAL, initial REAL, auto INTEGER, started_at INTEGER);
+            CREATE TABLE IF NOT EXISTS positions(symbol TEXT PRIMARY KEY, qty INTEGER, cost REAL);
+            CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, symbol TEXT, side TEXT,
+              qty INTEGER, price REAL, currency TEXT, fx REAL, amount REAL, fee REAL, pnl REAL, pnl_pct REAL,
+              source TEXT, feed TEXT, note TEXT);
+            """
+        )
+        if not DB.execute("SELECT 1 FROM account WHERE id=1").fetchone():
+            DB.execute("INSERT INTO account VALUES(1,?,?,0,?)", (INITIAL_CAPITAL, INITIAL_CAPITAL, int(time.time() * 1000)))
+        DB.commit()
+        E["auto"] = bool(DB.execute("SELECT auto FROM account WHERE id=1").fetchone()[0])
+
+
+def trade_row(r):
+    return {"id": r["id"], "ts": r["ts"], "symbol": r["symbol"], "side": r["side"], "qty": r["qty"], "price": r["price"],
+            "currency": r["currency"], "fx": r["fx"], "amountCny": r["amount"], "feeCny": r["fee"], "pnlCny": r["pnl"],
+            "pnlPct": r["pnl_pct"], "source": r["source"], "feed": r["feed"], "note": r["note"] or ""}
+
+
+def fx_for(sym):
+    return 1.0 if sym["currency"] == "CNY" else E["fx"]["rate"]
+
+
+def execute(code, side, qty, source):
+    sym = next((s for s in SYMBOLS if s["code"] == code), None)
+    if not sym:
+        return {"ok": False, "error": "未知标的"}
+    if not isinstance(qty, int) or qty <= 0:
+        return {"ok": False, "error": "数量必须是正整数"}
+    if qty % sym["lot"] != 0:
+        return {"ok": False, "error": "%s 最小交易单位为 %d" % (code, sym["lot"])}
+    with LOCK:
+        q = E["quotes"].get(code)
+        if not q or q["price"] <= 0:
+            return {"ok": False, "error": "暂无行情,无法成交"}
+        price = q["price"]
+        fx = fx_for(sym)
+        amount = r2(price * qty * fx)
+        fee = r2(amount * FEE_RATE)
+        now_ms = int(time.time() * 1000)
+        notes = []
+        st = market_state(sym["market"], time.time())
+        if st != "open":
+            notes.append("%s·按最近价成交" % STATE_LABEL[st])
+        if q["feed"] == "sim":
+            notes.append("模拟行情")
+        if q["feed"] == "stale":
+            notes.append("行情延迟")
+        acc = DB.execute("SELECT * FROM account WHERE id=1").fetchone()
+        pos = DB.execute("SELECT * FROM positions WHERE symbol=?", (code,)).fetchone()
+        cur_qty = pos["qty"] if pos else 0
+        cur_cost = pos["cost"] if pos else 0.0
+        pnl = pnl_pct = None
+        if side == "BUY":
+            need = r2(amount + fee)
+            if acc["cash"] + 1e-9 < need:
+                return {"ok": False, "error": "资金不足:需要 ¥%s,可用 ¥%s" % (need, r2(acc["cash"]))}
+            DB.execute("UPDATE account SET cash=? WHERE id=1", (r4(acc["cash"] - need),))
+            DB.execute("INSERT INTO positions(symbol,qty,cost) VALUES(?,?,?) ON CONFLICT(symbol) DO UPDATE SET qty=excluded.qty, cost=excluded.cost",
+                       (code, cur_qty + qty, r4(cur_cost + need)))
+        else:
+            if cur_qty < qty:
+                return {"ok": False, "error": "持仓不足:持有 %d,欲卖 %d" % (cur_qty, qty)}
+            proceeds = r2(amount - fee)
+            cost_part = cur_cost * (qty / cur_qty)
+            pnl = r2(proceeds - cost_part)
+            pnl_pct = pnl / cost_part if cost_part > 0 else 0.0
+            DB.execute("UPDATE account SET cash=? WHERE id=1", (r4(acc["cash"] + proceeds),))
+            DB.execute("UPDATE positions SET qty=?, cost=? WHERE symbol=?",
+                       (cur_qty - qty, 0 if cur_qty - qty == 0 else r4(cur_cost - cost_part), code))
+        cur = DB.execute(
+            "INSERT INTO trades(ts,symbol,side,qty,price,currency,fx,amount,fee,pnl,pnl_pct,source,feed,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now_ms, code, side, qty, price, sym["currency"], fx, amount, fee, pnl, pnl_pct, source, q["feed"], ";".join(notes)))
+        DB.commit()
+        row = DB.execute("SELECT * FROM trades WHERE id=?", (cur.lastrowid,)).fetchone()
+        return {"ok": True, "trade": trade_row(row)}
+
+
+def run_strategy():
+    now = time.time()
+    acc = DB.execute("SELECT cash FROM account WHERE id=1").fetchone()
+    cash = acc["cash"]
+    poss = {r["symbol"]: r for r in DB.execute("SELECT * FROM positions")}
+    for s in SYMBOLS:
+        q = E["quotes"].get(s["code"])
+        sig = E["signals"].get(s["code"])
+        if not q or not sig or not sig["ready"]:
+            continue
+        if q["feed"] not in ("sina", "tencent"):
+            continue
+        if market_state(s["market"], now) != "open":
+            continue
+        if now - E["last_auto"].get(s["code"], 0) < AUTO_COOLDOWN_S:
+            continue
+        fx = fx_for(s)
+        pos = poss.get(s["code"])
+        if pos and pos["qty"] > 0:
+            mv = q["price"] * fx * pos["qty"]
+            ret = (mv - pos["cost"]) / pos["cost"] if pos["cost"] > 0 else 0
+            if ret >= TAKE_PROFIT or ret <= -STOP_LOSS or sig["action"] == "SELL":
+                r = execute(s["code"], "SELL", pos["qty"], "auto")
+                if r["ok"]:
+                    E["last_auto"][s["code"]] = now
+                    cash += r["trade"]["amountCny"]
+        elif sig["action"] == "BUY":
+            unit = q["price"] * fx * (1 + FEE_RATE) * s["lot"]
+            lots = int((cash * AUTO_CASH_FRACTION) // unit)
+            if lots >= 1:
+                r = execute(s["code"], "BUY", lots * s["lot"], "auto")
+                if r["ok"]:
+                    E["last_auto"][s["code"]] = now
+                    cash -= r["trade"]["amountCny"] + r["trade"]["feeCny"]
+
+
+# ----------------------------- 轮询线程 -----------------------------
+def apply_real(sym, raw, now_ms):
+    prev = E["quotes"].get(sym["code"])
+    if prev and prev["feed"] == "sim":
+        E["ticks"][sym["code"]] = []
+    E["quotes"][sym["code"]] = dict(raw, lastOk=now_ms)
+
+
+def apply_fallback(sym, now_ms):
+    q = E["quotes"].get(sym["code"])
+    if q and q["feed"] != "sim":
+        if now_ms - q["lastOk"] > 10000:
+            q["feed"] = "stale"
+        return
+    base = q["price"] if q else sym["base"]
+    price = base * (1 + (random.random() - 0.5) * 0.0012)
+    price = round(price, sym["decimals"])
+    E["quotes"][sym["code"]] = {
+        "code": sym["code"], "price": price, "prevClose": q["prevClose"] if q else sym["base"],
+        "open": q["open"] if q else sym["base"], "high": max(q["high"] if q else price, price),
+        "low": min(q["low"] if q else price, price), "quoteTime": now_ms, "feed": "sim", "lastOk": now_ms}
+
+
+def poll():
+    t0 = time.time()
+    res, name, err = None, "sina", ""
+    try:
+        res = fetch_sina()
+    except Exception as ex:
+        err = "sina: %s" % ex
+
+    def missing():
+        return [s for s in SYMBOLS if not res or s["code"] not in res["quotes"]]
+
+    if not res or missing():
+        try:
+            t = fetch_tencent()
+            if not res:
+                res, name = t, "tencent"
+            else:
+                for s in missing():
+                    if s["code"] in t["quotes"]:
+                        res["quotes"][s["code"]] = t["quotes"][s["code"]]
+                name = "sina+tencent"
+        except Exception as ex:
+            err += " tencent: %s" % ex
+    now_ms = int(time.time() * 1000)
+    with LOCK:
+        got = bool(res and res["quotes"])
+        if got:
+            E["feed"] = {"name": name, "ok": True, "latency": now_ms - int(t0 * 1000), "lastOkAt": now_ms, "error": ""}
+        else:
+            E["feed"] = dict(E["feed"], name=name, ok=False, latency=now_ms - int(t0 * 1000), error=err or "no data")
+        if res and res.get("fx"):
+            E["fx"] = {"rate": res["fx"], "src": "sina", "at": now_ms}
+    if not (res and res.get("fx")) and now_ms - E["fx"]["at"] > 60000:
+        E["fx"]["at"] = now_ms
+        try:
+            y = fetch_yahoo_fx()
+            if y:
+                E["fx"] = {"rate": y, "src": "yahoo", "at": now_ms}
+        except Exception:
+            pass
+    sec = now_ms // 1000 * 1000
+    with LOCK:
+        for s in SYMBOLS:
+            raw = res["quotes"].get(s["code"]) if res else None
+            if raw:
+                apply_real(s, raw, now_ms)
+            else:
+                apply_fallback(s, now_ms)
+            q = E["quotes"][s["code"]]
+            arr = E["ticks"].setdefault(s["code"], [])
+            if not arr or arr[-1][0] < sec:
+                arr.append([sec, q["price"]])
+                if len(arr) > TICK_MAX:
+                    del arr[: len(arr) - TICK_MAX]
+                E["signals"][s["code"]] = analyze([x[1] for x in arr])
+        if E["auto"]:
+            run_strategy()
+
+
+def poll_loop():
+    while True:
+        t = time.time()
+        try:
+            poll()
+        except Exception as ex:  # 轮询失败不应让线程退出
+            print("poll error:", ex, file=sys.stderr)
+        time.sleep(max(0.05, POLL_S - (time.time() - t)))
+
+
+# ----------------------------- 对外查询 -----------------------------
+def build_state(since):
+    now_ms = int(time.time() * 1000)
+    with LOCK:
+        acc = DB.execute("SELECT * FROM account WHERE id=1").fetchone()
+        poss = DB.execute("SELECT * FROM positions").fetchall()
+        st = DB.execute(
+            "SELECT count(*) n, sum(side='BUY') buys, sum(side='SELL') sells, "
+            "sum(side='SELL' AND pnl>0) wins, coalesce(sum(pnl),0) realized, coalesce(sum(fee),0) fees FROM trades").fetchone()
+        n, buys, sells, wins = st["n"] or 0, st["buys"] or 0, st["sells"] or 0, st["wins"] or 0
+        recent = [trade_row(r) for r in DB.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 40")]
+        quotes = []
+        for s in SYMBOLS:
+            q = E["quotes"].get(s["code"])
+            state = market_state(s["market"], time.time())
+            quotes.append({
+                "code": s["code"], "name": s["name"], "short": s["short"], "market": s["market"],
+                "currency": s["currency"], "lot": s["lot"], "decimals": s["decimals"],
+                "price": q["price"] if q else None, "prevClose": q["prevClose"] if q else None,
+                "open": q["open"] if q else None, "high": q["high"] if q else None, "low": q["low"] if q else None,
+                "change": (q["price"] - q["prevClose"]) if q else None,
+                "pct": ((q["price"] / q["prevClose"] - 1) * 100) if q and q["prevClose"] > 0 else None,
+                "quoteTime": q["quoteTime"] if q else None, "feed": q["feed"] if q else "none",
+                "state": state, "stateLabel": STATE_LABEL[state]})
+        mv = cost = 0.0
+        pos_out = []
+        for p in poss:
+            if p["qty"] <= 0:
+                continue
+            s = next(x for x in SYMBOLS if x["code"] == p["symbol"])
+            q = E["quotes"].get(p["symbol"])
+            fx = fx_for(s)
+            value = q["price"] * fx * p["qty"] if q else 0.0
+            mv += value
+            cost += p["cost"]
+            pos_out.append({"symbol": p["symbol"], "qty": p["qty"], "costCny": p["cost"],
+                            "avgPrice": p["cost"] / (p["qty"] * fx), "mvCny": value, "pnlCny": value - p["cost"],
+                            "pnlPct": (value - p["cost"]) / p["cost"] if p["cost"] > 0 else 0})
+        equity = acc["cash"] + mv
+        ticks = {s["code"]: [t for t in E["ticks"].get(s["code"], []) if t[0] > since] for s in SYMBOLS}
+        return {
+            "ts": now_ms, "epoch": E["epoch"], "quotes": quotes, "ticks": ticks, "signals": E["signals"],
+            "fx": E["fx"], "feed": E["feed"],
+            "account": {"cash": acc["cash"], "initial": acc["initial"], "equity": equity, "marketValue": mv,
+                        "unrealized": mv - cost, "realized": st["realized"], "fees": st["fees"],
+                        "returnPct": (equity / acc["initial"] - 1) * 100, "auto": bool(acc["auto"]),
+                        "startedAt": acc["started_at"]},
+            "positions": pos_out,
+            "stats": {"trades": n, "buys": buys, "sells": sells, "wins": wins, "losses": sells - wins,
+                      "winRate": (wins / sells * 100) if sells > 0 else None},
+            "trades": recent}
+
+
+def list_trades(offset, limit):
+    with LOCK:
+        total = DB.execute("SELECT count(*) FROM trades").fetchone()[0]
+        rows = DB.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        return {"total": total, "rows": [trade_row(r) for r in rows]}
+
+
+def set_auto(enabled):
+    with LOCK:
+        DB.execute("UPDATE account SET auto=? WHERE id=1", (1 if enabled else 0,))
+        DB.commit()
+        E["auto"] = bool(enabled)
+
+
+def reset_account():
+    with LOCK:
+        DB.execute("DELETE FROM trades")
+        DB.execute("DELETE FROM positions")
+        DB.execute("UPDATE account SET cash=?, initial=?, auto=0, started_at=? WHERE id=1",
+                   (INITIAL_CAPITAL, INITIAL_CAPITAL, int(time.time() * 1000)))
+        DB.commit()
+        E["auto"] = False
+        E["last_auto"] = {}
+
+
+# ----------------------------- HTTP -----------------------------
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        try:
+            if u.path in ("/", "/site", "/index.html"):
+                with open(INDEX_PATH, "rb") as f:
+                    return self._send(200, f.read(), "text/html; charset=utf-8")
+            if u.path == "/api/state":
+                return self._json(build_state(int(float(q.get("since", ["0"])[0] or 0))))
+            if u.path == "/api/trades":
+                off = max(0, int(q.get("offset", ["0"])[0] or 0))
+                lim = min(100000, max(1, int(q.get("limit", ["50"])[0] or 50)))
+                return self._json(list_trades(off, lim))
+            if u.path == "/api/health":
+                return self._json({"ok": True})
+            return self._send(404, "not found", "text/plain; charset=utf-8")
+        except Exception as ex:
+            return self._json({"error": str(ex)}, 500)
+
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        except Exception:
+            return self._json({"ok": False, "error": "请求格式错误"}, 400)
+        try:
+            if u.path == "/api/trade":
+                side = str(body.get("side", "")).upper()
+                if side not in ("BUY", "SELL"):
+                    return self._json({"ok": False, "error": "side 必须是 BUY 或 SELL"}, 400)
+                qty = body.get("qty")
+                try:
+                    qty = int(qty)
+                except Exception:
+                    qty = 0
+                r = execute(str(body.get("symbol", "")), side, qty, "manual")
+                return self._json(r, 200 if r["ok"] else 400)
+            if u.path == "/api/auto":
+                set_auto(bool(body.get("enabled")))
+                return self._json({"ok": True, "enabled": bool(body.get("enabled"))})
+            if u.path == "/api/reset":
+                reset_account()
+                return self._json({"ok": True})
+            return self._send(404, "not found", "text/plain; charset=utf-8")
+        except Exception as ex:
+            return self._json({"ok": False, "error": str(ex)}, 500)
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    init_db()
+    threading.Thread(target=poll_loop, daemon=True).start()
+    httpd = Server(("0.0.0.0", PORT), Handler)
+    print("量化终端已启动: http://127.0.0.1:%d  (数据库 %s)" % (PORT, DB_PATH), flush=True)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+INDEX_HTML = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>生物科技ETF 量化终端 · BIOTECH QUANT</title>
+<style>
+:root{--bg:#000;--panel:#05080c;--panel2:#080c12;--line:#121b28;--txt:#d9e2ef;--dim:#6a7a91;--acc:#3ab4ff;--gold:#f5b942;--vio:#c77dff;--up:#ff3b4e;--dn:#19c37d;--warn:#f5b942}
+body[data-cc="us"]{--up:#19c37d;--dn:#ff3b4e}
+*{box-sizing:border-box}
+html{font-size:min(1vw,1.7778vh);background:#000}
+body{margin:0;width:100vw;height:100vh;overflow:hidden;background:#000;color:var(--txt);font-family:-apple-system,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif;font-size:1rem;line-height:1.25;user-select:none}
+.mono,.num{font-family:"SF Mono",Menlo,Consolas,"Roboto Mono",monospace;font-variant-numeric:tabular-nums}
+#app{display:grid;grid-template-rows:3.2rem minmax(0,1fr) 14.2rem;gap:.5rem;padding:.5rem;height:100vh;width:100vw}
+.panel{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:.55rem;position:relative;min-height:0;min-width:0;overflow:hidden}
+.ttl{font-size:.72rem;letter-spacing:.14em;color:var(--dim);text-transform:uppercase}
+.up{color:var(--up)}.dn{color:var(--dn)}.dim{color:var(--dim)}.gold{color:var(--gold)}.acc{color:var(--acc)}
+/* header */
+#hdr{display:flex;align-items:center;gap:1rem;padding:0 1rem}
+#hdr .logo{display:flex;align-items:baseline;gap:.6rem;white-space:nowrap}
+#hdr .logo b{font-size:1.35rem;letter-spacing:.06em;background:linear-gradient(90deg,#fff,var(--acc));-webkit-background-clip:text;background-clip:text;color:transparent}
+#hdr .logo span{font-size:.72rem;color:var(--dim);letter-spacing:.2em}
+.chips{display:flex;gap:.5rem;align-items:center;margin-left:.5rem}
+.chip{display:inline-flex;align-items:center;gap:.35rem;padding:.18rem .55rem;border:1px solid var(--line);border-radius:99rem;font-size:.78rem;color:var(--dim);white-space:nowrap}
+.chip i{width:.45rem;height:.45rem;border-radius:50%;background:var(--dim);display:inline-block}
+.chip.open{color:var(--txt);border-color:#1d3a2c}.chip.open i{background:var(--dn);box-shadow:0 0 .5rem var(--dn)}
+.chip.pre,.chip.post,.chip.lunch{color:var(--warn)}.chip.pre i,.chip.post i,.chip.lunch i{background:var(--warn)}
+.sp{flex:1}
+#feed{font-size:.8rem;display:flex;align-items:center;gap:.4rem;white-space:nowrap}
+#feed i{width:.55rem;height:.55rem;border-radius:50%;display:inline-block}
+#clock{font-size:1.25rem;letter-spacing:.05em;color:#fff}
+.btn{background:#0b121b;color:var(--txt);border:1px solid #1b2738;border-radius:.4rem;padding:.3rem .7rem;font-size:.8rem;cursor:pointer;font-family:inherit;white-space:nowrap}
+.btn:hover{border-color:var(--acc);color:#fff}
+.btn.on{background:#0d2a40;border-color:var(--acc);color:#fff}
+.btn.danger.arm{background:#3a0d14;border-color:var(--up);color:#fff}
+/* main grid */
+#main{display:grid;grid-template-columns:17.5rem minmax(0,1fr) 21rem;gap:.5rem;min-height:0}
+#left{display:grid;grid-template-rows:repeat(3,minmax(0,1fr));gap:.5rem;min-height:0}
+.card{padding:.7rem .8rem;cursor:pointer;display:flex;flex-direction:column;gap:.15rem;transition:border-color .15s}
+.card.sel{border-color:var(--acc);box-shadow:inset 0 0 0 1px rgba(58,180,255,.35),0 0 1.6rem rgba(58,180,255,.12)}
+.card .r1{display:flex;justify-content:space-between;align-items:center}
+.card .code{font-size:1.15rem;font-weight:700;letter-spacing:.04em}
+.card .nm{font-size:.7rem;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .px{font-size:2.05rem;font-weight:700;line-height:1.1;margin-top:.1rem}
+.card .chg{font-size:.95rem}
+.card .mini{display:grid;grid-template-columns:1fr 1fr;gap:0 .6rem;font-size:.7rem;color:var(--dim)}
+.card canvas{width:100%;flex:1;min-height:0;display:block}
+.card .pos{font-size:.72rem;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.flash-up{animation:fu .5s}.flash-dn{animation:fd .5s}
+@keyframes fu{from{background:rgba(255,59,78,.0);text-shadow:0 0 .8rem var(--up)}to{text-shadow:none}}
+@keyframes fd{from{text-shadow:0 0 .8rem var(--dn)}to{text-shadow:none}}
+/* center */
+#center{display:flex;flex-direction:column;min-height:0}
+#chead{display:flex;align-items:center;gap:.8rem;padding:.55rem .9rem .2rem}
+#chead .big{font-size:1.5rem;font-weight:700}
+#chead .px{font-size:1.5rem;font-weight:700}
+#chead .grp{display:flex;gap:.3rem}
+#chartwrap{flex:1;min-height:0;position:relative}
+#chart{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:crosshair}
+#cfoot{display:grid;grid-template-columns:repeat(6,auto) 1fr;gap:.2rem 1.2rem;align-items:center;padding:.4rem .9rem .55rem;border-top:1px solid var(--line);font-size:.82rem;white-space:nowrap}
+#cfoot .k{color:var(--dim);font-size:.7rem;display:block}
+.sig{display:inline-block;padding:.15rem .6rem;border-radius:.35rem;font-weight:700;font-size:.85rem}
+.sig.BUY{background:rgba(255,59,78,.16);color:var(--up);border:1px solid var(--up)}
+body[data-cc="us"] .sig.BUY{background:rgba(25,195,125,.16)}
+.sig.SELL{background:rgba(25,195,125,.16);color:var(--dn);border:1px solid var(--dn)}
+body[data-cc="us"] .sig.SELL{background:rgba(255,59,78,.16)}
+.sig.HOLD{background:#0d1520;color:var(--dim);border:1px solid var(--line)}
+/* right */
+#right{display:grid;grid-template-rows:auto auto minmax(0,1fr);gap:.5rem;min-height:0}
+#acct{padding:.7rem .9rem}
+#acct .eq{font-size:2rem;font-weight:700;line-height:1.1}
+#acct .grid{display:grid;grid-template-columns:1fr 1fr;gap:.25rem .8rem;margin-top:.45rem;font-size:.8rem}
+#acct .grid div{display:flex;justify-content:space-between}
+#trade{padding:.7rem .9rem;display:flex;flex-direction:column;gap:.4rem}
+#trade .row{display:flex;gap:.4rem;align-items:center}
+#trade input{flex:1;min-width:0;background:#02050a;border:1px solid #1b2738;color:#fff;border-radius:.4rem;padding:.35rem .5rem;font-size:1.1rem;text-align:center;font-family:inherit;outline:none;user-select:text}
+#trade input:focus{border-color:var(--acc)}
+.sq{width:2rem;padding:.3rem 0;text-align:center}
+.qk{font-size:.7rem;padding:.12rem .45rem}
+.bs{flex:1;padding:.6rem 0;font-size:1.05rem;font-weight:700;border:0;border-radius:.45rem;color:#fff;cursor:pointer;font-family:inherit}
+.bs.buy{background:var(--up)}.bs.sell{background:var(--dn)}
+.bs:disabled{opacity:.4;cursor:wait}
+.bs:hover{filter:brightness(1.15)}
+#msg{font-size:.76rem;min-height:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#auto{padding:.6rem .9rem;display:flex;flex-direction:column;gap:.3rem;font-size:.76rem}
+#auto .reasons{color:var(--dim);overflow:hidden;line-height:1.35}
+.bar{height:.35rem;background:#0d1520;border-radius:9rem;overflow:hidden}
+.bar>div{height:100%;background:var(--acc);width:0}
+/* footer */
+#foot{display:grid;grid-template-columns:minmax(0,1fr) 25rem;gap:.5rem;min-height:0}
+#log{display:flex;flex-direction:column;padding:.5rem .8rem}
+#log .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem}
+table{border-collapse:collapse;width:100%;font-size:.8rem}
+th{color:var(--dim);font-weight:400;text-align:right;padding:.12rem .4rem;font-size:.7rem;border-bottom:1px solid var(--line);white-space:nowrap}
+td{text-align:right;padding:0 .4rem;height:1.55rem;white-space:nowrap;border-bottom:1px solid #0b121b}
+th:nth-child(1),td:nth-child(1),th:nth-child(2),td:nth-child(2){text-align:left}
+td.note{text-align:left;color:var(--dim);max-width:9rem;overflow:hidden;text-overflow:ellipsis}
+.tag{padding:.05rem .4rem;border-radius:.25rem;font-size:.72rem;font-weight:700}
+.tag.BUY{background:rgba(255,59,78,.16);color:var(--up)}.tag.SELL{background:rgba(25,195,125,.16);color:var(--dn)}
+body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .tag.SELL{background:rgba(255,59,78,.16)}
+#logbody{flex:1;min-height:0;overflow:hidden}
+.empty{color:var(--dim);text-align:center;padding-top:2.5rem;font-size:.9rem}
+#stats{display:grid;grid-template-columns:8.2rem 1fr;gap:.8rem;align-items:center;padding:.7rem .9rem}
+#ring{width:8rem;height:8rem;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--dim) 0 100%)}
+#ring>div{width:6.2rem;height:6.2rem;border-radius:50%;background:#05080c;display:flex;flex-direction:column;align-items:center;justify-content:center}
+#ring b{font-size:1.7rem;line-height:1}
+#ring span{font-size:.68rem;color:var(--dim);margin-top:.2rem}
+#stats .kv{display:grid;grid-template-columns:1fr auto;gap:.2rem .5rem;font-size:.82rem}
+#stats .kv span:nth-child(odd){color:var(--dim)}
+#stats .kv span:nth-child(even){text-align:right}
+/* modal */
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:9}
+#modal.on{display:flex}
+#mbox{width:88vw;height:84vh;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:.6rem;background:#04070b;border:1px solid #1b2738;border-radius:.7rem}
+#mbox .bar2{display:flex;gap:.6rem;align-items:center}
+#mtable{flex:1;min-height:0;overflow:hidden}
+</style>
+</head>
+<body data-cc="cn">
+<div id="app">
+  <header id="hdr" class="panel">
+    <div class="logo"><b>生物科技ETF 量化终端</b><span>BIOTECH QUANT</span></div>
+    <div class="chips" id="mkts"></div>
+    <div class="sp"></div>
+    <div id="feed"><i style="background:#555"></i><span>连接中…</span></div>
+    <div class="chip mono" id="fx">USD/CNY --</div>
+    <button class="btn" id="cc" title="切换红涨绿跌 / 绿涨红跌">红涨绿跌</button>
+    <button class="btn danger" id="reset">重置账户</button>
+    <div id="clock" class="mono">--:--:--</div>
+  </header>
+
+  <div id="main">
+    <aside id="left"></aside>
+
+    <section id="center" class="panel">
+      <div id="chead">
+        <div class="big" id="ctitle">IBB</div>
+        <div class="px mono" id="cpx">--</div>
+        <div class="mono" id="cchg">--</div>
+        <div class="sp"></div>
+        <div class="grp" id="gmode">
+          <button class="btn on" data-mode="single">单标的</button>
+          <button class="btn" data-mode="compare">三只对比 %</button>
+        </div>
+        <div class="grp" id="gwin">
+          <button class="btn on" data-win="60">1分</button>
+          <button class="btn" data-win="300">5分</button>
+          <button class="btn" data-win="900">15分</button>
+          <button class="btn" data-win="1800">30分</button>
+        </div>
+        <div class="grp">
+          <button class="btn on" id="tma">均线</button>
+          <button class="btn on" id="tbo">布林</button>
+        </div>
+      </div>
+      <div id="chartwrap"><canvas id="chart"></canvas></div>
+      <div id="cfoot">
+        <div><span class="k">MA30</span><b class="mono gold" id="i_ma30">--</b></div>
+        <div><span class="k">MA120</span><b class="mono" id="i_ma120" style="color:var(--vio)">--</b></div>
+        <div><span class="k">RSI(60)</span><b class="mono" id="i_rsi">--</b></div>
+        <div><span class="k">布林上/下轨</span><b class="mono dim" id="i_boll">--</b></div>
+        <div><span class="k">综合评分</span><b class="mono" id="i_score">--</b></div>
+        <div><span class="k">策略信号</span><span class="sig HOLD" id="i_sig">预热中</span></div>
+        <div class="dim" id="i_reason" style="overflow:hidden;text-overflow:ellipsis;text-align:right"></div>
+      </div>
+    </section>
+
+    <aside id="right">
+      <div id="acct" class="panel">
+        <div class="ttl">模拟账户 · 人民币</div>
+        <div class="eq mono" id="a_eq">¥10,000.00</div>
+        <div class="mono" id="a_ret" style="font-size:.9rem">--</div>
+        <div class="grid">
+          <div><span class="dim">可用现金</span><span class="mono" id="a_cash">--</span></div>
+          <div><span class="dim">持仓市值</span><span class="mono" id="a_mv">--</span></div>
+          <div><span class="dim">已实现</span><span class="mono" id="a_real">--</span></div>
+          <div><span class="dim">浮动盈亏</span><span class="mono" id="a_unreal">--</span></div>
+        </div>
+      </div>
+      <div id="trade" class="panel">
+        <div class="row" style="justify-content:space-between"><span class="ttl">模拟下单</span><b id="t_sym">IBB</b><span class="dim mono" id="t_lot" style="font-size:.72rem"></span></div>
+        <div class="row">
+          <button class="btn sq" id="qm">−</button>
+          <input id="qty" type="number" min="1" step="1" value="1" inputmode="numeric">
+          <button class="btn sq" id="qp">+</button>
+        </div>
+        <div class="row" style="flex-wrap:wrap;gap:.25rem">
+          <span class="dim" style="font-size:.7rem;width:3.1rem">买入量</span>
+          <button class="btn qk" data-b="0.25">资金25%</button><button class="btn qk" data-b="0.5">50%</button><button class="btn qk" data-b="1">全仓</button>
+          <span class="dim" style="font-size:.7rem;width:3.1rem">卖出量</span>
+          <button class="btn qk" data-s="0.5">持仓50%</button><button class="btn qk" data-s="1">全部</button>
+        </div>
+        <div class="row dim mono" style="font-size:.74rem;justify-content:space-between"><span id="t_est">预计 --</span><span id="t_pos">持仓 0</span></div>
+        <div class="row"><button class="bs buy" id="bbuy">买入</button><button class="bs sell" id="bsell">卖出</button></div>
+        <div id="msg" class="dim"></div>
+      </div>
+      <div id="auto" class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <span class="ttl">量化自动策略</span>
+          <button class="btn" id="autobtn">已关闭</button>
+        </div>
+        <div class="bar"><div id="warm"></div></div>
+        <div class="reasons" id="a_note">评分≥2 买入(50%现金) · 评分≤-1 或 +1.2% 止盈 / -0.8% 止损 平仓。仅在交易时段 + 真实行情下运行。</div>
+      </div>
+    </aside>
+  </div>
+
+  <footer id="foot">
+    <section id="log" class="panel">
+      <div class="top"><span class="ttl">成交日志 · 北京时间</span><span><span class="dim mono" id="l_cnt" style="font-size:.74rem"></span> <button class="btn" id="allog">全部日志 / 导出CSV</button></span></div>
+      <div id="logbody"></div>
+    </section>
+    <section id="stats" class="panel">
+      <div id="ring"><div><b class="mono" id="w_pct">--</b><span>胜率</span></div></div>
+      <div class="kv mono">
+        <span>总成交</span><span id="s_n">0</span>
+        <span>买入 / 卖出</span><span id="s_bs">0 / 0</span>
+        <span>盈利 / 亏损</span><span id="s_wl">0 / 0</span>
+        <span>已实现盈亏</span><span id="s_real">¥0.00</span>
+        <span>累计手续费</span><span id="s_fee">¥0.00</span>
+        <span>胜率口径</span><span class="dim" style="font-size:.7rem">已平仓盈利笔数/卖出笔数</span>
+      </div>
+    </section>
+  </footer>
+</div>
+
+<div id="modal"><div id="mbox">
+  <div class="bar2"><b style="font-size:1.1rem">全部成交日志</b><span class="dim mono" id="m_info"></span><div class="sp"></div>
+    <button class="btn" id="m_prev">上一页</button><button class="btn" id="m_next">下一页</button>
+    <button class="btn on" id="m_csv">导出CSV</button><button class="btn" id="m_close">关闭</button></div>
+  <div id="mtable"></div>
+</div></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const TZ = "Asia/Shanghai";
+const dtf = new Intl.DateTimeFormat("sv-SE", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+const fmtDT = (ms) => dtf.format(new Date(ms));
+const fmtT = (ms) => fmtDT(ms).slice(11);
+const rem = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+const money = (v, sign) => (v == null || isNaN(v) ? "--" : (sign && v > 0 ? "+" : v < 0 ? "-" : "") + "¥" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+const pct = (v, d) => (v == null || isNaN(v) ? "--" : (v > 0 ? "+" : "") + v.toFixed(d == null ? 2 : d) + "%");
+const cls = (v) => (v > 0 ? "up" : v < 0 ? "dn" : "dim");
+const CUR = { USD: "$", CNY: "¥" };
+const MAXT = 1800;
+
+const S = { epoch: 0, ticks: {}, q: [], sig: {}, acct: null, pos: [], stats: null, trades: [], fx: null, feed: null, last: {} };
+let sel = "IBB", mode = "single", winN = 60, showMA = true, showBO = true, mouse = null, busy = false;
+let colors = { up: "#ff3b4e", dn: "#19c37d" };
+const CMP = { IBB: "#3ab4ff", XBI: "#f5b942", "159502": "#c77dff" };
+
+function readColors() {
+  const cs = getComputedStyle(document.body);
+  colors.up = cs.getPropertyValue("--up").trim(); colors.dn = cs.getPropertyValue("--dn").trim();
+}
+function setCC(v) { document.body.dataset.cc = v; localStorage.setItem("cc", v); $("cc").textContent = v === "cn" ? "红涨绿跌" : "绿涨红跌"; readColors(); renderAll(); }
+setCC(localStorage.getItem("cc") || "cn");
+
+const qOf = (c) => S.q.find((x) => x.code === c);
+const fp = (q, p) => (p == null ? "--" : p.toFixed(q ? q.decimals : 2));
+
+/* ---------------- 数据拉取:每秒一次 ---------------- */
+function sinceT() {
+  let m = Infinity;
+  for (const k in S.ticks) { const a = S.ticks[k]; m = Math.min(m, a.length ? a[a.length - 1][0] : 0); }
+  return m === Infinity ? 0 : m;
+}
+async function loop() {
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/api/state?since=" + sinceT(), { cache: "no-store" });
+    const s = await r.json();
+    if (s.error) throw new Error(s.error);
+    apply(s);
+  } catch (e) {
+    const f = $("feed"); f.innerHTML = '<i style="background:#ff3b4e"></i><span style="color:#ff3b4e">连接中断,重试中…</span>';
+  }
+  setTimeout(loop, Math.max(80, 1000 - (performance.now() - t0)));
+}
+function apply(s) {
+  if (S.epoch && S.epoch !== s.epoch) S.ticks = {};
+  S.epoch = s.epoch;
+  const prev = {}; S.q.forEach((x) => (prev[x.code] = x.price));
+  S.prevPx = prev;
+  for (const c in s.ticks) {
+    const arr = (S.ticks[c] = S.ticks[c] || []);
+    for (const t of s.ticks[c]) if (!arr.length || t[0] > arr[arr.length - 1][0]) arr.push(t);
+    if (arr.length > MAXT) arr.splice(0, arr.length - MAXT);
+  }
+  if (s.ticks) for (const c in S.ticks) { if (!s.ticks[c]) continue; }
+  S.q = s.quotes; S.sig = s.signals; S.acct = s.account; S.pos = s.positions; S.stats = s.stats; S.trades = s.trades; S.fx = s.fx; S.feed = s.feed; S.now = s.ts;
+  renderAll();
+}
+
+/* ---------------- 渲染 ---------------- */
+function renderAll() {
+  if (!S.acct) return;
+  renderHeader(); renderCards(); renderCenter(); renderAccount(); renderTrade(); renderLog(); renderStats(); drawMain();
+}
+function renderHeader() {
+  $("mkts").innerHTML = ["US", "CN"].map((m) => {
+    const q = S.q.find((x) => x.market === m);
+    return q ? '<span class="chip ' + q.state + '"><i></i>' + (m === "US" ? "美股 " : "A股 ") + q.stateLabel + "</span>" : "";
+  }).join("");
+  const f = S.feed, anySim = S.q.some((q) => q.feed === "sim"), anyStale = S.q.some((q) => q.feed === "stale");
+  let h;
+  if (anySim) h = '<i style="background:#f5b942"></i><span style="color:#f5b942">模拟行情(外网不可用,仅演示)</span>';
+  else if (anyStale || !f.ok) h = '<i style="background:#f5b942"></i><span style="color:#f5b942">行情延迟 · ' + (f.error || "stale") + "</span>";
+  else h = '<i style="background:#19c37d;box-shadow:0 0 .5rem #19c37d"></i><span>实时 · ' + f.name + " · " + f.latency + "ms · 1秒刷新</span>";
+  $("feed").innerHTML = h;
+  $("fx").textContent = "USD/CNY " + S.fx.rate.toFixed(4) + (S.fx.src === "default" ? " (兜底)" : "");
+}
+function renderCards() {
+  const box = $("left");
+  if (!box.children.length) {
+    box.innerHTML = S.q.map((q) => '<div class="panel card" data-code="' + q.code + '"><div class="r1"><span class="code">' + q.code + '</span><span class="chip st"></span></div><div class="nm">' + q.name + '</div><div class="px mono"></div><div class="chg mono"></div><canvas></canvas><div class="mini mono"></div><div class="pos"></div></div>').join("");
+    box.addEventListener("click", (e) => { const c = e.target.closest(".card"); if (c) { sel = c.dataset.code; $("qty").value = qOf(sel).lot; renderAll(); } });
+  }
+  S.q.forEach((q, i) => {
+    const el = box.children[i];
+    el.classList.toggle("sel", q.code === sel);
+    const st = el.querySelector(".st"); st.className = "chip st " + q.state; st.innerHTML = "<i></i>" + q.stateLabel;
+    const px = el.querySelector(".px"); const txt = CUR[q.currency] + fp(q, q.price);
+    if (px.textContent !== txt) {
+      const pv = S.prevPx && S.prevPx[q.code];
+      px.textContent = txt;
+      if (pv != null && q.price !== pv) { px.classList.remove("flash-up", "flash-dn"); void px.offsetWidth; px.classList.add(q.price > pv ? "flash-up" : "flash-dn"); }
+    }
+    px.className = "px mono " + cls(q.change) + (px.classList.contains("flash-up") ? " flash-up" : px.classList.contains("flash-dn") ? " flash-dn" : "");
+    const ch = el.querySelector(".chg"); ch.className = "chg mono " + cls(q.change);
+    ch.textContent = (q.change > 0 ? "+" : "") + fp(q, q.change) + "  " + pct(q.pct);
+    el.querySelector(".mini").innerHTML = "<span>开 " + fp(q, q.open) + "</span><span>昨收 " + fp(q, q.prevClose) + "</span><span>高 " + fp(q, q.high) + "</span><span>低 " + fp(q, q.low) + "</span><span style='grid-column:1/3'>报价时间 " + (q.quoteTime ? fmtDT(q.quoteTime).slice(5) : "--") + "</span>";
+    const p = S.pos.find((x) => x.symbol === q.code);
+    el.querySelector(".pos").innerHTML = p ? '持仓 <b class="mono">' + p.qty + '</b> · 浮盈 <span class="mono ' + cls(p.pnlCny) + '">' + money(p.pnlCny, 1) + " (" + pct(p.pnlPct * 100) + ")</span>" : "无持仓";
+    spark(el.querySelector("canvas"), q);
+  });
+}
+function spark(cv, q) {
+  const { x, w, h } = prep(cv); x.clearRect(0, 0, w, h);
+  const a = (S.ticks[q.code] || []).slice(-180); if (a.length < 2) return;
+  let mn = Infinity, mx = -Infinity; a.forEach((t) => { mn = Math.min(mn, t[1]); mx = Math.max(mx, t[1]); });
+  if (mx === mn) { mx += 1e-6; mn -= 1e-6; }
+  const col = q.change >= 0 ? colors.up : colors.dn;
+  x.beginPath(); a.forEach((t, i) => { const X = (i / (a.length - 1)) * w, Y = h - 2 - ((t[1] - mn) / (mx - mn)) * (h - 4); i ? x.lineTo(X, Y) : x.moveTo(X, Y); });
+  x.strokeStyle = col; x.lineWidth = 1.5; x.stroke();
+  x.lineTo(w, h); x.lineTo(0, h); x.closePath();
+  const g = x.createLinearGradient(0, 0, 0, h); g.addColorStop(0, col + "44"); g.addColorStop(1, col + "00"); x.fillStyle = g; x.fill();
+}
+function renderCenter() {
+  const q = qOf(sel); if (!q) return;
+  $("ctitle").innerHTML = q.code + ' <span class="dim" style="font-size:.85rem;font-weight:400">' + q.name + "</span>";
+  const px = $("cpx"); px.textContent = CUR[q.currency] + fp(q, q.price); px.className = "px mono " + cls(q.change);
+  const ch = $("cchg"); ch.textContent = (q.change > 0 ? "+" : "") + fp(q, q.change) + "  " + pct(q.pct); ch.className = "mono " + cls(q.change);
+  const s = S.sig[sel];
+  const f = (v, d) => (v == null ? "--" : v.toFixed(d));
+  const dd = q.decimals;
+  if (s && s.ready) {
+    $("i_ma30").textContent = f(s.maFast, dd); $("i_ma120").textContent = f(s.maSlow, dd);
+    $("i_rsi").textContent = f(s.rsi, 1); $("i_rsi").className = "mono " + (s.rsi < 30 ? "dn" : s.rsi > 70 ? "up" : "");
+    $("i_boll").textContent = f(s.bollUp, dd) + " / " + f(s.bollLow, dd);
+    $("i_score").textContent = (s.score > 0 ? "+" : "") + s.score; $("i_score").className = "mono " + (s.score > 0 ? "up" : s.score < 0 ? "dn" : "dim");
+    const lab = { BUY: "买入信号", SELL: "卖出信号", HOLD: "观望" };
+    $("i_sig").className = "sig " + s.action; $("i_sig").textContent = lab[s.action];
+    $("i_reason").textContent = s.reasons.join(" · ") || "无显著信号";
+    $("warm").style.width = "100%";
+  } else {
+    ["i_ma30", "i_ma120", "i_rsi", "i_boll", "i_score"].forEach((k) => ($(k).textContent = "--"));
+    $("i_sig").className = "sig HOLD"; $("i_sig").textContent = "预热 " + (s ? s.warm : 0) + "/" + (s ? s.need : 120) + "s";
+    $("i_reason").textContent = "指标基于 1 秒采样,采满 120 秒后启用";
+    $("warm").style.width = (s ? Math.min(100, (s.warm / s.need) * 100) : 0) + "%";
+  }
+}
+function renderAccount() {
+  const a = S.acct;
+  $("a_eq").textContent = money(a.equity).replace("+", "");
+  const r = $("a_ret"); r.className = "mono " + cls(a.returnPct); r.textContent = "总收益 " + pct(a.returnPct) + "  ·  本金 " + money(a.initial);
+  $("a_cash").textContent = money(a.cash); $("a_mv").textContent = money(a.marketValue);
+  $("a_real").textContent = money(a.realized, 1); $("a_real").className = "mono " + cls(a.realized);
+  $("a_unreal").textContent = money(a.unrealized, 1); $("a_unreal").className = "mono " + cls(a.unrealized);
+  const b = $("autobtn"); b.textContent = a.auto ? "运行中 · 点击关闭" : "已关闭 · 点击开启"; b.className = "btn" + (a.auto ? " on" : "");
+}
+function fxOf(q) { return q.currency === "CNY" ? 1 : S.fx.rate; }
+function renderTrade() {
+  const q = qOf(sel); if (!q) return;
+  $("t_sym").textContent = q.code; $("t_lot").textContent = "最小单位 " + q.lot;
+  const qty = parseInt($("qty").value, 10) || 0;
+  const amt = q.price * qty * fxOf(q);
+  $("t_est").textContent = "预计 " + money(amt * 1.0003).replace("+", "") + (q.currency === "USD" ? " (" + CUR.USD + (q.price * qty).toFixed(2) + ")" : "");
+  const p = S.pos.find((x) => x.symbol === sel);
+  $("t_pos").textContent = "持仓 " + (p ? p.qty : 0);
+}
+function renderLog() {
+  const body = $("logbody");
+  const rowH = 1.55 * rem(), headH = 1.5 * rem();
+  const max = Math.max(1, Math.floor((body.clientHeight - headH) / rowH));
+  $("l_cnt").textContent = "共 " + S.stats.trades + " 笔 · 显示最近 " + Math.min(max, S.trades.length) + " 笔";
+  if (!S.trades.length) { body.innerHTML = '<div class="empty">暂无成交 — 在右侧"模拟下单"买入或开启自动策略,每笔都会精确记录于此</div>'; return; }
+  body.innerHTML = tableHTML(S.trades.slice(0, max));
+}
+function tableHTML(rows) {
+  const h = "<table><thead><tr><th>时间</th><th>标的</th><th>方向</th><th>成交价</th><th>数量</th><th>成交额(¥)</th><th>手续费</th><th>盈亏(¥)</th><th>来源</th><th style='text-align:left'>备注</th></tr></thead><tbody>";
+  return h + rows.map((t) => {
+    const q = qOf(t.symbol); const d = q ? q.decimals : 2;
+    return "<tr class='mono'><td>" + fmtDT(t.ts).slice(5) + "</td><td>" + t.symbol + "</td><td><span class='tag " + t.side + "'>" + (t.side === "BUY" ? "买入" : "卖出") + "</span></td><td>" + (CUR[t.currency] || "") + t.price.toFixed(d) + "</td><td>" + t.qty + "</td><td>" + t.amountCny.toFixed(2) + "</td><td class='dim'>" + t.feeCny.toFixed(2) + "</td><td class='" + (t.pnlCny == null ? "dim" : cls(t.pnlCny)) + "'>" + (t.pnlCny == null ? "--" : (t.pnlCny > 0 ? "+" : "") + t.pnlCny.toFixed(2) + " (" + pct(t.pnlPct * 100) + ")") + "</td><td>" + (t.source === "auto" ? "<span class='acc'>自动</span>" : "手动") + "</td><td class='note'>" + (t.note || (t.feed === "sim" ? "模拟行情" : "")) + "</td></tr>";
+  }).join("") + "</tbody></table>";
+}
+function renderStats() {
+  const s = S.stats, a = S.acct;
+  const wr = s.winRate;
+  $("w_pct").textContent = wr == null ? "--" : wr.toFixed(1) + "%";
+  const ring = $("ring");
+  if (wr == null) ring.style.background = "conic-gradient(#1a2434 0 100%)";
+  else ring.style.background = "conic-gradient(" + colors.up + " 0 " + wr + "%, " + colors.dn + " " + wr + "% 100%)";
+  $("s_n").textContent = s.trades; $("s_bs").textContent = s.buys + " / " + s.sells; $("s_wl").textContent = s.wins + " / " + s.losses;
+  $("s_real").textContent = money(a.realized, 1); $("s_real").className = cls(a.realized);
+  $("s_fee").textContent = money(a.fees);
+}
+
+/* ---------------- 图表 ---------------- */
+function prep(cv) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const x = cv.getContext("2d"); x.setTransform(dpr, 0, 0, dpr, 0, 0); return { x, w, h };
+}
+const memo = {};
+function indic(code) {
+  const a = S.ticks[code] || []; const key = code + ":" + a.length + ":" + (a.length ? a[a.length - 1][0] : 0);
+  if (memo[code] && memo[code].key === key) return memo[code];
+  const n = a.length, p = new Float64Array(n), c1 = new Float64Array(n + 1), c2 = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) { p[i] = a[i][1]; c1[i + 1] = c1[i] + p[i]; c2[i + 1] = c2[i] + p[i] * p[i]; }
+  const ma = (w) => { const o = new Array(n).fill(null); for (let i = w - 1; i < n; i++) o[i] = (c1[i + 1] - c1[i + 1 - w]) / w; return o; };
+  const m30 = ma(30), m120 = ma(120), up = new Array(n).fill(null), lo = new Array(n).fill(null);
+  for (let i = 119; i < n; i++) { const m = m120[i]; const v = Math.max(0, (c2[i + 1] - c2[i - 119]) / 120 - m * m); const sd = Math.sqrt(v); up[i] = m + 2 * sd; lo[i] = m - 2 * sd; }
+  return (memo[code] = { key, m30, m120, up, lo });
+}
+function niceTicks(mn, mx, k) { const s = (mx - mn) / k; const o = []; for (let i = 0; i <= k; i++) o.push(mn + s * i); return o; }
+function drawMain() {
+  const cv = $("chart"); const { x, w, h } = prep(cv); x.clearRect(0, 0, w, h);
+  const r = rem(), L = 0.8 * r, R = 5.4 * r, T = 0.9 * r, B = 1.8 * r, cw = w - L - R, ch = h - T - B;
+  x.font = Math.round(0.78 * r) + "px SF Mono,Menlo,Consolas,monospace"; x.textBaseline = "middle";
+  const codes = mode === "single" ? [sel] : S.q.map((q) => q.code);
+  let n = Infinity; codes.forEach((c) => (n = Math.min(n, (S.ticks[c] || []).length)));
+  n = Math.min(n, winN);
+  if (!isFinite(n) || n < 2) { x.fillStyle = "#6a7a91"; x.textAlign = "center"; x.fillText("等待行情数据…", w / 2, h / 2); return; }
+  const Xi = (i) => L + (i / (n - 1)) * cw;
+  let series; // [{code, vals, color}]
+  const q0 = qOf(sel);
+  let mn = Infinity, mx = -Infinity, ind = null, start;
+  if (mode === "single") {
+    const a = S.ticks[sel]; start = a.length - n; ind = indic(sel);
+    const vals = []; for (let i = 0; i < n; i++) vals.push(a[start + i][1]);
+    series = [{ code: sel, vals, t: a.slice(start).map((t) => t[0]) }];
+    vals.forEach((v) => { mn = Math.min(mn, v); mx = Math.max(mx, v); });
+    if (showMA) for (let i = 0; i < n; i++) for (const arr of [ind.m30, ind.m120]) { const v = arr[start + i]; if (v != null) { mn = Math.min(mn, v); mx = Math.max(mx, v); } }
+  } else {
+    series = codes.map((c) => { const a = S.ticks[c]; const st = a.length - n; const b = a[st][1]; return { code: c, vals: a.slice(st).map((t) => (t[1] / b - 1) * 100), t: a.slice(st).map((t) => t[0]) }; });
+    series.forEach((s) => s.vals.forEach((v) => { mn = Math.min(mn, v); mx = Math.max(mx, v); }));
+  }
+  if (mx - mn < 1e-9) { const e = Math.abs(mx) * 0.0005 || 0.001; mx += e; mn -= e; }
+  const pad = (mx - mn) * 0.12; mn -= pad; mx += pad;
+  const Y = (v) => T + (1 - (v - mn) / (mx - mn)) * ch;
+  // grid
+  x.strokeStyle = "#101a27"; x.lineWidth = 1; x.fillStyle = "#6a7a91"; x.textAlign = "left";
+  for (const v of niceTicks(mn, mx, 6)) { const y = Math.round(Y(v)) + 0.5; x.beginPath(); x.moveTo(L, y); x.lineTo(L + cw, y); x.stroke(); x.fillText(mode === "single" ? v.toFixed(q0.decimals) : pct(v), L + cw + 0.5 * r, y); }
+  const t = series[0].t; x.textAlign = "center";
+  for (let k = 0; k <= 5; k++) { const i = Math.round((k * (n - 1)) / 5); const X = Xi(i); x.strokeStyle = "#0b131e"; x.beginPath(); x.moveTo(Math.round(X) + 0.5, T); x.lineTo(Math.round(X) + 0.5, T + ch); x.stroke(); x.fillStyle = "#6a7a91"; x.fillText(fmtT(t[i]), Math.min(Math.max(X, L + 2.2 * r), L + cw - 1.5 * r), h - B / 2 + 2); }
+  x.save(); x.beginPath(); x.rect(L, T, cw, ch); x.clip();
+  if (mode === "single") {
+    const s = series[0], up = s.vals[n - 1] >= s.vals[0], col = up ? colors.up : colors.dn;
+    if (showBO) {
+      x.beginPath(); let started = false;
+      for (let i = 0; i < n; i++) { const v = ind.up[start + i]; if (v == null) continue; started ? x.lineTo(Xi(i), Y(v)) : x.moveTo(Xi(i), Y(v)); started = true; }
+      for (let i = n - 1; i >= 0; i--) { const v = ind.lo[start + i]; if (v == null) continue; x.lineTo(Xi(i), Y(v)); }
+      x.closePath(); x.fillStyle = "rgba(58,180,255,.07)"; x.fill();
+      x.strokeStyle = "rgba(58,180,255,.35)"; x.lineWidth = 1; x.setLineDash([4, 4]);
+      for (const arr of [ind.up, ind.lo]) { x.beginPath(); started = false; for (let i = 0; i < n; i++) { const v = arr[start + i]; if (v == null) continue; started ? x.lineTo(Xi(i), Y(v)) : x.moveTo(Xi(i), Y(v)); started = true; } x.stroke(); }
+      x.setLineDash([]);
+    }
+    // area + price line
+    x.beginPath(); s.vals.forEach((v, i) => (i ? x.lineTo(Xi(i), Y(v)) : x.moveTo(Xi(i), Y(v))));
+    x.strokeStyle = col; x.lineWidth = 2.2; x.lineJoin = "round"; x.stroke();
+    x.lineTo(Xi(n - 1), T + ch); x.lineTo(Xi(0), T + ch); x.closePath();
+    const g = x.createLinearGradient(0, T, 0, T + ch); g.addColorStop(0, col + "40"); g.addColorStop(1, col + "00"); x.fillStyle = g; x.fill();
+    if (showMA) for (const [arr, c] of [[ind.m120, "#c77dff"], [ind.m30, "#f5b942"]]) { x.beginPath(); let st2 = false; for (let i = 0; i < n; i++) { const v = arr[start + i]; if (v == null) continue; st2 ? x.lineTo(Xi(i), Y(v)) : x.moveTo(Xi(i), Y(v)); st2 = true; } x.strokeStyle = c; x.lineWidth = 1.4; x.stroke(); }
+    // 昨收线
+    if (q0.prevClose > mn && q0.prevClose < mx) { x.strokeStyle = "#344256"; x.setLineDash([2, 5]); x.beginPath(); x.moveTo(L, Y(q0.prevClose)); x.lineTo(L + cw, Y(q0.prevClose)); x.stroke(); x.setLineDash([]); }
+    // 成交标记
+    const t0 = t[0], t1 = t[n - 1];
+    for (const tr of S.trades) {
+      if (tr.symbol !== sel || tr.ts < t0 - 1500 || tr.ts > t1 + 2500) continue;
+      const i = Math.max(0, Math.min(n - 1, Math.round(((tr.ts - t0) / Math.max(1, t1 - t0)) * (n - 1)))); const X = Xi(i), Yv = Y(tr.price), buy = tr.side === "BUY";
+      x.fillStyle = buy ? colors.up : colors.dn; x.beginPath();
+      if (buy) { x.moveTo(X, Yv + 3); x.lineTo(X - 7, Yv + 17); x.lineTo(X + 7, Yv + 17); } else { x.moveTo(X, Yv - 3); x.lineTo(X - 7, Yv - 17); x.lineTo(X + 7, Yv - 17); }
+      x.closePath(); x.fill(); x.fillStyle = "#fff"; x.textAlign = "center"; x.font = "bold " + Math.round(0.7 * r) + "px sans-serif"; x.fillText(buy ? "买" : "卖", X, buy ? Yv + 13 : Yv - 12);
+    }
+  } else {
+    x.strokeStyle = "#344256"; x.setLineDash([2, 5]); x.beginPath(); x.moveTo(L, Y(0)); x.lineTo(L + cw, Y(0)); x.stroke(); x.setLineDash([]);
+    series.forEach((s) => { x.beginPath(); s.vals.forEach((v, i) => (i ? x.lineTo(Xi(i), Y(v)) : x.moveTo(Xi(i), Y(v)))); x.strokeStyle = CMP[s.code]; x.lineWidth = 2; x.stroke(); });
+  }
+  x.restore();
+  // 最新价标签
+  x.font = "bold " + Math.round(0.8 * r) + "px SF Mono,Menlo,Consolas,monospace"; x.textAlign = "left";
+  series.forEach((s) => {
+    const v = s.vals[n - 1], y = Y(v), col = mode === "single" ? (s.vals[n - 1] >= s.vals[0] ? colors.up : colors.dn) : CMP[s.code];
+    x.strokeStyle = col; x.globalAlpha = 0.5; x.setLineDash([3, 3]); x.beginPath(); x.moveTo(L, y); x.lineTo(L + cw, y); x.stroke(); x.setLineDash([]); x.globalAlpha = 1;
+    x.fillStyle = col; x.fillRect(L + cw, y - 0.8 * r, R - 0.2 * r, 1.6 * r); x.fillStyle = "#000";
+    x.fillText(mode === "single" ? v.toFixed(q0.decimals) : s.code + " " + pct(v, 2), L + cw + 0.3 * r, y);
+    x.beginPath(); x.arc(Xi(n - 1), y, 3.5, 0, 7); x.fillStyle = col; x.fill();
+  });
+  // 图例 / 十字光标
+  x.font = Math.round(0.8 * r) + "px SF Mono,Menlo,Consolas,monospace"; x.textAlign = "left";
+  if (mode === "compare") { let lx = L + 0.6 * r; series.forEach((s) => { x.fillStyle = CMP[s.code]; x.fillRect(lx, T + 0.5 * r, 1.2 * r, 3); x.fillText(s.code, lx + 1.5 * r, T + 0.6 * r + 3); lx += 7 * r; }); }
+  if (mouse && mouse.x >= L && mouse.x <= L + cw && mouse.y >= T && mouse.y <= T + ch) {
+    const i = Math.max(0, Math.min(n - 1, Math.round(((mouse.x - L) / cw) * (n - 1))));
+    x.strokeStyle = "#5b6b82"; x.setLineDash([3, 3]); x.beginPath(); x.moveTo(Xi(i), T); x.lineTo(Xi(i), T + ch); x.moveTo(L, mouse.y); x.lineTo(L + cw, mouse.y); x.stroke(); x.setLineDash([]);
+    let txt = fmtT(t[i]);
+    series.forEach((s) => { txt += mode === "single" ? "   价 " + s.vals[i].toFixed(q0.decimals) + "   较窗口起点 " + pct((s.vals[i] / s.vals[0] - 1) * 100) : "   " + s.code + " " + pct(s.vals[i]); });
+    x.fillStyle = "rgba(0,0,0,.75)"; x.fillRect(L + 0.4 * r, T + (mode === "compare" ? 1.7 * r : 0.2 * r), x.measureText(txt).width + r, 1.5 * r);
+    x.fillStyle = "#fff"; x.fillText(txt, L + 0.9 * r, T + (mode === "compare" ? 1.7 * r : 0.2 * r) + 0.75 * r);
+    const yv = mn + (1 - (mouse.y - T) / ch) * (mx - mn);
+    x.fillStyle = "#2a3a50"; x.fillRect(L + cw, mouse.y - 0.7 * r, R - 0.2 * r, 1.4 * r); x.fillStyle = "#fff"; x.fillText(mode === "single" ? yv.toFixed(q0.decimals) : pct(yv), L + cw + 0.3 * r, mouse.y);
+  }
+}
+
+/* ---------------- 交互 ---------------- */
+$("chart").addEventListener("mousemove", (e) => { const b = e.target.getBoundingClientRect(); mouse = { x: e.clientX - b.left, y: e.clientY - b.top }; drawMain(); });
+$("chart").addEventListener("mouseleave", () => { mouse = null; drawMain(); });
+window.addEventListener("resize", () => S.acct && renderAll());
+$("gmode").addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; mode = b.dataset.mode; [...$("gmode").children].forEach((c) => c.classList.toggle("on", c === b)); drawMain(); });
+$("gwin").addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; winN = +b.dataset.win; [...$("gwin").children].forEach((c) => c.classList.toggle("on", c === b)); drawMain(); });
+$("tma").onclick = () => { showMA = !showMA; $("tma").classList.toggle("on", showMA); drawMain(); };
+$("tbo").onclick = () => { showBO = !showBO; $("tbo").classList.toggle("on", showBO); drawMain(); };
+$("cc").onclick = () => setCC(document.body.dataset.cc === "cn" ? "us" : "cn");
+$("qty").addEventListener("input", renderTrade);
+$("qm").onclick = () => { const q = qOf(sel); $("qty").value = Math.max(q.lot, (parseInt($("qty").value, 10) || 0) - q.lot); renderTrade(); };
+$("qp").onclick = () => { const q = qOf(sel); $("qty").value = (parseInt($("qty").value, 10) || 0) + q.lot; renderTrade(); };
+document.querySelector("#trade").addEventListener("click", (e) => {
+  const b = e.target.closest(".qk"); if (!b) return; const q = qOf(sel);
+  if (b.dataset.b) { const unit = q.price * fxOf(q) * 1.0003 * q.lot; $("qty").value = Math.max(q.lot, Math.floor((S.acct.cash * +b.dataset.b) / unit) * q.lot); }
+  else { const p = S.pos.find((x) => x.symbol === sel); const have = p ? p.qty : 0; $("qty").value = Math.max(q.lot, Math.floor((have * +b.dataset.s) / q.lot) * q.lot); }
+  renderTrade();
+});
+let msgTimer;
+function say(t, ok) { const m = $("msg"); m.textContent = t; m.style.color = ok ? "var(--acc)" : "var(--warn)"; clearTimeout(msgTimer); msgTimer = setTimeout(() => (m.textContent = ""), 6000); }
+async function order(side) {
+  if (busy) return; busy = true; $("bbuy").disabled = $("bsell").disabled = true;
+  try {
+    const r = await fetch("/api/trade", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol: sel, side, qty: parseInt($("qty").value, 10) }) });
+    const j = await r.json();
+    if (j.ok) { const t = j.trade, q = qOf(sel); say((side === "BUY" ? "✔ 买入 " : "✔ 卖出 ") + t.symbol + " " + t.qty + " @ " + CUR[t.currency] + t.price.toFixed(q.decimals) + (t.pnlCny != null ? "  盈亏 " + money(t.pnlCny, 1) : ""), true); }
+    else say("✘ " + (j.error || "下单失败"), false);
+  } catch (e) { say("✘ 网络错误", false); }
+  busy = false; $("bbuy").disabled = $("bsell").disabled = false;
+}
+$("bbuy").onclick = () => order("BUY"); $("bsell").onclick = () => order("SELL");
+$("autobtn").onclick = async () => { await fetch("/api/auto", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: !S.acct.auto }) }); };
+let armT; $("reset").onclick = async () => {
+  const b = $("reset");
+  if (!b.classList.contains("arm")) { b.classList.add("arm"); b.textContent = "再点一次确认清空"; armT = setTimeout(() => { b.classList.remove("arm"); b.textContent = "重置账户"; }, 3000); return; }
+  clearTimeout(armT); b.classList.remove("arm"); b.textContent = "重置账户";
+  await fetch("/api/reset", { method: "POST" }); say("账户已重置为 ¥10,000,日志已清空", true);
+};
+/* 全部日志(分页,无需滚动) */
+let mPage = 0, mTotal = 0, mPer = 12;
+async function loadModal() {
+  const r = await (await fetch("/api/trades?offset=" + mPage * mPer + "&limit=" + mPer, { cache: "no-store" })).json();
+  mTotal = r.total; const pages = Math.max(1, Math.ceil(mTotal / mPer));
+  $("m_info").textContent = "共 " + mTotal + " 笔 · 第 " + (mPage + 1) + " / " + pages + " 页";
+  $("mtable").innerHTML = r.rows.length ? tableHTML(r.rows) : '<div class="empty">暂无成交记录</div>';
+  $("m_prev").disabled = mPage <= 0; $("m_next").disabled = mPage + 1 >= pages;
+}
+$("allog").onclick = () => { mPage = 0; $("modal").classList.add("on"); loadModal(); };
+$("m_close").onclick = () => $("modal").classList.remove("on");
+$("m_prev").onclick = () => { mPage--; loadModal(); };
+$("m_next").onclick = () => { mPage++; loadModal(); };
+$("m_csv").onclick = async () => {
+  const r = await (await fetch("/api/trades?offset=0&limit=100000", { cache: "no-store" })).json();
+  const head = "id,时间(北京),标的,方向,成交价,币种,汇率,数量,成交额CNY,手续费CNY,盈亏CNY,盈亏%,来源,行情源,备注";
+  const rows = r.rows.slice().reverse().map((t) => [t.id, fmtDT(t.ts), t.symbol, t.side, t.price, t.currency, t.fx, t.qty, t.amountCny, t.feeCny, t.pnlCny == null ? "" : t.pnlCny, t.pnlPct == null ? "" : (t.pnlPct * 100).toFixed(3), t.source, t.feed, '"' + (t.note || "") + '"'].join(","));
+  const blob = new Blob(["\ufeff" + head + "\n" + rows.join("\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "trades.csv"; a.click();
+};
+setInterval(() => { $("clock").textContent = fmtT(Date.now()); }, 250);
+loop();
+</script>
+</body>
+</html>
+'''
+
+with open(os.path.join(ROOT, "server.py"), "w", encoding="utf-8") as f:
+    f.write(SERVER_PY)
+with open(os.path.join(ROOT, "index.html"), "w", encoding="utf-8") as f:
+    f.write(INDEX_HTML)
+print("✔ 文件已写入", ROOT)
+
+# 1) 清理旧进程(方括号写法避免 pkill 误杀自身所在的 shell)
+subprocess.run("pkill -f '[q]uant/server.py'; pkill -f '[c]loudflared tunnel'; pkill -f '[l]ocalhost.run'", shell=True)
+time.sleep(1)
+
+# 2) 启动后端(行情轮询 + 模拟交易 + 网页)
+env = dict(os.environ, PORT=str(PORT), PYTHONUNBUFFERED="1")
+server_log = open(os.path.join(ROOT, "server.log"), "w")
+server = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py")], env=env,
+                          stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
+ok = False
+for _ in range(60):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:%d/api/health" % PORT, timeout=1).read()
+        ok = True
+        break
+    except Exception:
+        if server.poll() is not None:
+            break
+        time.sleep(0.5)
+if not ok:
+    print(open(os.path.join(ROOT, "server.log")).read())
+    raise SystemExit("✘ 后端启动失败,请把上面的日志发给我")
+print("✔ 后端已启动: http://127.0.0.1:%d" % PORT)
+
+# 联网自检:新浪行情源
+try:
+    req = urllib.request.Request("https://hq.sinajs.cn/list=sz159502", headers={"Referer": "https://finance.sina.com.cn"})
+    urllib.request.urlopen(req, timeout=4).read()
+    print("✔ 行情源可访问(新浪)")
+except Exception as ex:
+    print("⚠ 行情源不可访问:%s  → 请确认 Settings → Internet 已开启;否则页面会显示『模拟行情』" % ex)
+
+# 3) 公网隧道:优先 cloudflared(免账号),失败则回退 localhost.run(ssh)
+def wait_url(path, pattern, tries=60):
+    for _ in range(tries):
+        time.sleep(1)
+        try:
+            m = re.search(pattern, open(path).read())
+            if m:
+                return m.group(0)
+        except Exception:
+            pass
+    return None
+
+public_url = None
+try:
+    cf = os.path.join(ROOT, "cloudflared")
+    if not os.path.exists(cf):
+        print("… 下载 cloudflared")
+        urllib.request.urlretrieve(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", cf)
+        os.chmod(cf, 0o755)
+    cf_log = os.path.join(ROOT, "cloudflared.log")
+    subprocess.Popen([cf, "tunnel", "--url", "http://127.0.0.1:%d" % PORT, "--no-autoupdate"],
+                     stdout=open(cf_log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    public_url = wait_url(cf_log, r"https://[a-z0-9-]+\.trycloudflare\.com")
+except Exception as ex:
+    print("⚠ cloudflared 不可用:", ex)
+
+if not public_url:
+    print("… 改用 localhost.run 隧道")
+    lh_log = os.path.join(ROOT, "lhr.log")
+    subprocess.Popen(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30",
+                      "-R", "80:127.0.0.1:%d" % PORT, "nokey@localhost.run"],
+                     stdout=open(lh_log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    public_url = wait_url(lh_log, r"https://[a-z0-9]+\.lhr\.life")
+
+if public_url:
+    with open(os.path.join(ROOT, "url.txt"), "w") as f:
+        f.write(public_url)
+    print("\n" + "=" * 60)
+    print("🚀 量化终端网址(点击打开):", public_url)
+    print("=" * 60)
+    print("提示:刚生成的网址偶尔需要 10~20 秒才生效,打不开就稍等刷新。")
+    try:
+        from IPython.display import HTML, display
+        display(HTML('<a href="%s" target="_blank" style="font-size:20px">👉 打开量化终端</a>' % public_url))
+    except Exception:
+        pass
+else:
+    print("✘ 公网隧道建立失败。后端仍在 127.0.0.1:%d 运行;请确认 Internet 已开启后重新运行本单元。" % PORT)
