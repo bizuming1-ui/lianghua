@@ -82,15 +82,21 @@ export async function buildCodePack(): Promise<CodePack> {
 
   const tpl = (await read(base, "kaggle/launch_cell.py"))?.content ?? "";
   const server = (await read(base, "kaggle/server.py"))?.content ?? "";
+  const ai = (await read(base, "kaggle/ai_engine.py"))?.content ?? "";
+  const math = (await read(base, "kaggle/quant_math.py"))?.content ?? "";
   const index = (await read(base, "public/terminal/index.html"))?.content ?? "";
   const status = (await read(base, "kaggle/status_cell.py"))?.content ?? "";
+  const llm = (await read(base, "kaggle/llm_cell.py"))?.content ?? "";
   let cell1 = embed(tpl, "__SERVER_PY__", server);
+  cell1 = embed(cell1, "__AI_PY__", ai);
+  cell1 = embed(cell1, "__MATH_PY__", math);
   cell1 = embed(cell1, "__INDEX_HTML__", index);
 
   const mk = (p: string, content: string): CodeFile => ({ path: p, content, lines: countLines(content) });
   const kaggle: CodeFile[] = [
-    mk("Cell 1 · 一键启动(写文件 + 启动服务 + 公网网址)", cell1),
-    mk("Cell 2 · 查看状态 / 重新打印网址 / 停止(可选)", status),
+    mk("Cell 0 · 双 T4 部署推理大模型(vLLM 张量并行,先运行)", llm),
+    mk("Cell 1 · 一键启动终端 + AI 引擎 + 公网网址", cell1),
+    mk("Cell 2 · 查看状态 / 双卡利用率 / 停止(可选)", status),
   ];
 
   return { github, kaggle, generatedAt: Date.now() };
