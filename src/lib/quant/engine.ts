@@ -6,6 +6,9 @@ import {
   AUTO_CASH_FRACTION,
   DEFAULT_FX,
   FEE_RATE,
+  FEE_FLAT,
+  FEE_FLAT_BELOW,
+  feeFor,
   INITIAL_CAPITAL,
   POLL_MS,
   STOP_LOSS,
@@ -275,7 +278,7 @@ async function execute(code: string, side: "BUY" | "SELL", qty: number, source: 
   const price = q.price;
   const fx = fxFor(sym);
   const amount = r2(price * qty * fx);
-  const fee = r2(amount * FEE_RATE);
+  const fee = feeFor(amount);
   const now = Date.now();
   const notes: string[] = [];
   const st = marketState(sym.market, now);
@@ -367,8 +370,10 @@ async function runStrategy() {
         }
       }
     } else if (sig.action === "BUY") {
-      const unit = q.price * fx * (1 + FEE_RATE) * s.lot;
-      const lots = Math.floor((cash * AUTO_CASH_FRACTION) / unit);
+      const unit = q.price * fx * s.lot;
+      const budget = cash * AUTO_CASH_FRACTION;
+      let lots = Math.floor(budget / unit);
+      while (lots >= 1 && lots * unit + feeFor(lots * unit) > budget) lots -= 1; // 固定手续费也要放进预算
       if (lots >= 1) {
         const r = await execute(s.code, "BUY", lots * s.lot, "auto");
         if (r.ok) {
@@ -486,6 +491,7 @@ export async function buildState(since: number) {
     signals: e.signals,
     fx: e.fx,
     feed: e.feed,
+    fee: { flat: FEE_FLAT, below: FEE_FLAT_BELOW, rate: FEE_RATE },
     account: {
       cash: acc.cash,
       initial: acc.initialCapital,
