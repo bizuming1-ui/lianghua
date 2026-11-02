@@ -1,14 +1,16 @@
 # ==========================================================================
 #  Cell 0 · 在 Kaggle「GPU T4 x2」上部署推理大模型(vLLM 张量并行 TP=2,两张卡同时计算)
 #  使用前提:Settings → Accelerator = GPU T4 x2;Internet = ON
-#  默认模型:Qwen/Qwen3-14B-AWQ(稠密 4bit、带"思考模式"的推理模型,T4 上可用且速度可接受)
-#  想换模型:运行前设置环境变量 QUANT_LLM_MODEL,例如 Qwen/Qwen3-32B-AWQ(更强但更慢)
+#  默认模型:Qwen/Qwen3-32B-AWQ(稠密 4bit 的 32B 思考型推理模型;两张 T4 张量并行,显存约 18GB 权重 + KV 缓存)
+#     若 32B 加载失败(显存/版本问题)会自动降级到 Qwen/Qwen3-14B-AWQ,不用你操心。
+#  想指定模型:运行前设置环境变量 QUANT_LLM_MODEL(例如 Qwen/Qwen3-14B-AWQ 更快;QwQ-32B-AWQ 为纯推理模型)
 #  运行顺序:先运行本单元(首次约 8~20 分钟:安装 vLLM + 下载模型 + 加载),再运行 Cell 1
 #  本单元结尾会做"双卡同时工作"实测:并发请求时同时采样两张卡的利用率与显存
 # ==========================================================================
 import os, sys, re, time, json, subprocess, threading, urllib.request
 
-MODEL = os.environ.get("QUANT_LLM_MODEL", "Qwen/Qwen3-14B-AWQ")
+MODEL = os.environ.get("QUANT_LLM_MODEL", "Qwen/Qwen3-32B-AWQ")
+FALLBACK = "Qwen/Qwen3-14B-AWQ"
 SERVED = os.environ.get("QUANT_LLM_NAME", "quant-llm")
 PORT = int(os.environ.get("QUANT_LLM_PORT", "8001"))
 MAX_LEN = int(os.environ.get("QUANT_LLM_CTX", "8192"))
@@ -62,16 +64,18 @@ else:
 
     # 3) 启动(失败自动降级重试:eager 模式 → 更小上下文)-----------------------------
     attempts = [
-        ["--max-model-len", str(MAX_LEN), "--gpu-memory-utilization", "0.90"],
-        ["--max-model-len", str(MAX_LEN), "--gpu-memory-utilization", "0.88", "--enforce-eager"],
-        ["--max-model-len", "4096", "--gpu-memory-utilization", "0.85", "--enforce-eager"],
+        (MODEL, ["--max-model-len", str(MAX_LEN), "--gpu-memory-utilization", "0.92"]),
+        (MODEL, ["--max-model-len", "6144", "--gpu-memory-utilization", "0.90", "--enforce-eager"]),
     ]
+    if MODEL != FALLBACK:
+        attempts += [(FALLBACK, ["--max-model-len", str(MAX_LEN), "--gpu-memory-utilization", "0.90"]),
+                     (FALLBACK, ["--max-model-len", "4096", "--gpu-memory-utilization", "0.85", "--enforce-eager"])]
     ok = False
-    for n, extra in enumerate(attempts, 1):
+    for n, (model_n, extra) in enumerate(attempts, 1):
         sh("pkill -f 'vllm.entrypoints' ; sleep 3")
-        cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", MODEL, "--served-model-name", SERVED,
+        cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server", "--model", model_n, "--served-model-name", SERVED,
                "--tensor-parallel-size", "2", "--dtype", "half", "--host", "127.0.0.1", "--port", str(PORT),
-               "--max-num-seqs", "8"] + extra
+               "--max-num-seqs", "12", "--enable-prefix-caching"] + extra
         env = dict(os.environ, PYTHONUNBUFFERED="1", TOKENIZERS_PARALLELISM="false", VLLM_WORKER_MULTIPROC_METHOD="spawn")
         print("… 第 %d 次启动:%s" % (n, " ".join(cmd[3:])))
         proc = subprocess.Popen(cmd, env=env, stdout=open(LOG, "w"), stderr=subprocess.STDOUT, start_new_session=True)
@@ -94,11 +98,14 @@ else:
                 print("  [%3ds] %s  ||  %s" % (time.time() - t0, mem, tail))
             time.sleep(3)
         if ok:
+            USED = model_n
+            open(os.path.join(ROOT, "llm_model.txt"), "w").write(model_n)
+            print("✔ 使用模型:", model_n)
             break
-        print("✘ 本次启动失败,日志末尾:")
+        print("✘ 本次启动失败(%s),日志末尾:" % model_n)
         print("\n".join(open(LOG, errors="ignore").read().splitlines()[-25:]))
     if not ok:
-        raise SystemExit("✘ vLLM 三次启动均失败。请把上面的日志发给我。")
+        raise SystemExit("✘ vLLM 所有启动方案均失败。请把上面的日志发给我。")
     print("✔ 大模型服务已启动:", BASE)
 
 # 4) 双卡同时工作实测 ------------------------------------------------------------
