@@ -12,7 +12,9 @@
   GET  /api/health     健康检查
 
 行情源:新浪(主) -> 腾讯(备);全部失败时才使用明确标注的"模拟行情"。
-存储:SQLite(默认 /kaggle/working/quant.db,否则当前目录)。
+存储:SQLite(默认 /kaggle/working/quant.db,否则当前目录)+ 云备份/本地快照(persist.py),重开 Kaggle 自动恢复。
+手续费:每笔(买入或卖出)成交金额 < 10000 元 => 固定 5 元;>= 10000 元 => 万五(0.05%,与 5 元在 10000 处连续)。
+额外接口:/api/fast(毫秒级报价)、/api/indicators(全部指标)、/api/backup、/api/restore、/api/persist。
 """
 import json
 import math
@@ -47,7 +49,13 @@ try:
 except Exception as _ex:  # pragma: no cover
     ai_engine = None
     print("AI 模块不可用:", _ex, file=sys.stderr, flush=True)
+try:
+    import persist as persist_mod
+except Exception as _ex:  # pragma: no cover
+    persist_mod = None
+    print("持久化模块不可用:", _ex, file=sys.stderr, flush=True)
 AI = None
+PERSIST = None
 
 # ----------------------------- 配置(与 config.ts 保持一致) -----------------------------
 SYMBOLS = [
@@ -59,9 +67,10 @@ SYMBOLS = [
      "currency": "CNY", "lot": 100, "decimals": 3, "sina": "sz159502", "tencent": "sz159502", "base": 1.62},
 ]
 INITIAL_CAPITAL = 10000.0
-FEE_RATE = 0.0003
+FEE_FLAT, FEE_FLAT_BELOW, FEE_RATE = 5.0, 10000.0, 0.0005  # <1万元固定5元;>=1万元万五
 TICK_MAX = 7200
-POLL_S = 1.0
+POLL_S = max(0.2, float(os.environ.get("QUANT_POLL_S", "0.5")))  # 上游抓取间隔(秒);失败时自动退避
+QTICK_MAX = 3000
 DEFAULT_FX = 7.2
 MA_FAST, MA_SLOW, RSI_N, BOLL_N, BOLL_K = 30, 120, 60, 120, 2
 TAKE_PROFIT, STOP_LOSS = 0.012, 0.008
@@ -279,7 +288,7 @@ E = {
     "epoch": int(time.time() * 1000), "ticks": {}, "quotes": {}, "signals": {},
     "fx": {"rate": DEFAULT_FX, "src": "default", "at": 0},
     "feed": {"name": "-", "ok": False, "latency": 0, "lastOkAt": 0, "error": "starting"},
-    "auto": False, "auto_mode": 0, "last_auto": {},
+    "auto": False, "auto_mode": 0, "last_auto": {}, "qticks": {}, "poll_gap": POLL_S,
 }
 DB = sqlite3.connect(DB_PATH, check_same_thread=False)
 DB.row_factory = sqlite3.Row
@@ -291,6 +300,17 @@ def r2(v):
 
 def r4(v):
     return math.floor(v * 10000 + 0.5) / 10000
+
+
+def fee_for(amount):
+    """单笔手续费(元):成交金额 < 10000 => 5 元;>= 10000 => 万五。买卖同规则。"""
+    amount = abs(amount)
+    return FEE_FLAT if amount < FEE_FLAT_BELOW else r2(amount * FEE_RATE)
+
+
+def dirty(urgent=False):
+    if PERSIST:
+        PERSIST.mark_dirty(urgent)
 
 
 def init_db():
@@ -336,7 +356,7 @@ def execute(code, side, qty, source, extra_note=""):
         price = q["price"]
         fx = fx_for(sym)
         amount = r2(price * qty * fx)
-        fee = r2(amount * FEE_RATE)
+        fee = fee_for(amount)
         now_ms = int(time.time() * 1000)
         notes = [extra_note] if extra_note else []
         st = market_state(sym["market"], time.time())
@@ -373,6 +393,7 @@ def execute(code, side, qty, source, extra_note=""):
             (now_ms, code, side, qty, price, sym["currency"], fx, amount, fee, pnl, pnl_pct, source, q["feed"], ";".join(notes)))
         DB.commit()
         row = DB.execute("SELECT * FROM trades WHERE id=?", (cur.lastrowid,)).fetchone()
+        dirty(True)
         return {"ok": True, "trade": trade_row(row)}
 
 
@@ -403,8 +424,11 @@ def run_strategy():
                     E["last_auto"][s["code"]] = now
                     cash += r["trade"]["amountCny"]
         elif sig["action"] == "BUY":
-            unit = q["price"] * fx * (1 + FEE_RATE) * s["lot"]
-            lots = int((cash * AUTO_CASH_FRACTION) // unit)
+            unit = q["price"] * fx * s["lot"]
+            budget = cash * AUTO_CASH_FRACTION
+            lots = int(budget // unit)
+            while lots >= 1 and lots * unit + fee_for(lots * unit) > budget:
+                lots -= 1  # 固定手续费也要放进预算
             if lots >= 1:
                 r = execute(s["code"], "BUY", lots * s["lot"], "auto")
                 if r["ok"]:
@@ -490,6 +514,13 @@ def poll():
                 if len(arr) > TICK_MAX:
                     del arr[: len(arr) - TICK_MAX]
                 E["signals"][s["code"]] = analyze([x[1] for x in arr[-200:]])
+            elif arr[-1][1] != q["price"]:
+                arr[-1][1] = q["price"]  # 同一秒内保持最新价(以最后一次为准)
+            qt = E["qticks"].setdefault(s["code"], [])
+            if not qt or qt[-1][1] != q["price"] or qt[-1][2] != q["quoteTime"]:
+                qt.append([now_ms, q["price"], q["quoteTime"]])
+                if len(qt) > QTICK_MAX:
+                    del qt[: len(qt) - QTICK_MAX]
         if E["auto_mode"] == 1:
             run_strategy()
     if AI:
@@ -500,13 +531,16 @@ def poll():
 
 
 def poll_loop():
+    gap = POLL_S
     while True:
         t = time.time()
         try:
             poll()
         except Exception as ex:  # 轮询失败不应让线程退出
             print("poll error:", ex, file=sys.stderr)
-        time.sleep(max(0.05, POLL_S - (time.time() - t)))
+        gap = POLL_S if E["feed"]["ok"] else min(3.0, gap * 1.6)  # 失败指数退避,恢复后立刻回到高频
+        E["poll_gap"] = gap
+        time.sleep(max(0.03, gap - (time.time() - t)))
 
 
 # ----------------------------- 对外查询 -----------------------------
@@ -548,10 +582,12 @@ def build_state(since):
                             "avgPrice": p["cost"] / (p["qty"] * fx), "mvCny": value, "pnlCny": value - p["cost"],
                             "pnlPct": (value - p["cost"]) / p["cost"] if p["cost"] > 0 else 0})
         equity = acc["cash"] + mv
-        ticks = {s["code"]: [t for t in E["ticks"].get(s["code"], []) if t[0] > since] for s in SYMBOLS}
+        ticks = {s["code"]: [t for t in E["ticks"].get(s["code"], []) if t[0] >= since] for s in SYMBOLS}
         return {
             "ts": now_ms, "epoch": E["epoch"], "quotes": quotes, "ticks": ticks, "signals": E["signals"],
-            "fx": E["fx"], "feed": E["feed"],
+            "fx": E["fx"], "feed": dict(E["feed"], pollMs=int(E["poll_gap"] * 1000)),
+            "fee": {"flat": FEE_FLAT, "below": FEE_FLAT_BELOW, "rate": FEE_RATE},
+            "persist": PERSIST.status() if PERSIST else None,
             "account": {"cash": acc["cash"], "initial": acc["initial"], "equity": equity, "marketValue": mv,
                         "unrealized": mv - cost, "realized": st["realized"], "fees": st["fees"],
                         "returnPct": (equity / acc["initial"] - 1) * 100, "auto": bool(acc["auto"]), "autoMode": {0: "off", 1: "rule", 2: "ai"}.get(int(acc["auto"] or 0), "off"),
@@ -560,6 +596,19 @@ def build_state(since):
             "stats": {"trades": n, "buys": buys, "sells": sells, "wins": wins, "losses": sells - wins,
                       "winRate": (wins / sells * 100) if sells > 0 else None},
             "trades": recent}
+
+
+def build_fast():
+    """轻量报价(前端 200ms 轮询):只含价格与报价时间,响应体几百字节。"""
+    now_ms = int(time.time() * 1000)
+    with LOCK:
+        out = {}
+        for s in SYMBOLS:
+            q = E["quotes"].get(s["code"])
+            if q:
+                out[s["code"]] = [q["price"], q["prevClose"], q["high"], q["low"], q["quoteTime"], q["feed"], q.get("lastOk", 0)]
+        qt = {c: v[-1][0] if v else 0 for c, v in E["qticks"].items()}
+        return {"ts": now_ms, "q": out, "lat": E["feed"].get("latency", 0), "pollMs": int(E["poll_gap"] * 1000), "qt": qt, "ok": E["feed"]["ok"]}
 
 
 def list_trades(offset, limit):
@@ -577,6 +626,7 @@ def set_auto(mode):
         DB.commit()
         E["auto_mode"] = mode
         E["auto"] = mode == 1
+    dirty(True)
 
 
 def reset_account():
@@ -590,8 +640,49 @@ def reset_account():
         E["auto_mode"] = 0
         E["last_auto"] = {}
         if AI:
-            AI.plans.clear()
-            AI.last_trade.clear()
+            AI.reset_learning()
+    dirty(True)
+
+
+# ----------------------------- 备份 / 恢复 -----------------------------
+def db_is_fresh():
+    with LOCK:
+        n = DB.execute("SELECT count(*) FROM trades").fetchone()[0]
+        acc = DB.execute("SELECT cash, initial FROM account WHERE id=1").fetchone()
+        return n == 0 and abs(acc["cash"] - acc["initial"]) < 1e-6
+
+
+def export_state():
+    with LOCK:
+        acc = dict(DB.execute("SELECT * FROM account WHERE id=1").fetchone())
+        poss = [dict(r) for r in DB.execute("SELECT * FROM positions")]
+        trs = [dict(r) for r in DB.execute("SELECT * FROM trades ORDER BY id")]
+        sql = {"account": acc, "positions": poss, "trades": trs}
+    return {"app": "lianghua", "sql": sql, "ai": AI.export_state() if AI else {}, "settings": {"auto_mode": E["auto_mode"]}}
+
+
+def import_state(p, replace_sql=True):
+    """p: export_state() 的产物。没有 sql 段(或 replace_sql=False)时只恢复 AI 部分。"""
+    sql = p.get("sql") if replace_sql else None
+    if sql and sql.get("account"):
+        with LOCK:
+            a = sql["account"]
+            DB.execute("DELETE FROM trades")
+            DB.execute("DELETE FROM positions")
+            DB.execute("DELETE FROM account")
+            DB.execute("INSERT INTO account(id,cash,initial,auto,started_at) VALUES(1,?,?,?,?)",
+                       (a["cash"], a["initial"], a.get("auto", 0), a.get("started_at", int(time.time() * 1000))))
+            for r in sql.get("positions") or []:
+                DB.execute("INSERT INTO positions(symbol,qty,cost) VALUES(?,?,?)", (r["symbol"], r["qty"], r["cost"]))
+            for t in sql.get("trades") or []:
+                DB.execute("INSERT INTO trades(id,ts,symbol,side,qty,price,currency,fx,amount,fee,pnl,pnl_pct,source,feed,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (t["id"], t["ts"], t["symbol"], t["side"], t["qty"], t["price"], t["currency"], t["fx"], t["amount"], t["fee"],
+                            t.get("pnl"), t.get("pnl_pct"), t.get("source", "manual"), t.get("feed", "sina"), t.get("note", "")))
+            DB.commit()
+            mode = int(a.get("auto") or 0)
+            E["auto_mode"], E["auto"] = mode, mode == 1
+    if AI and p.get("ai"):
+        AI.import_state(p["ai"])
 
 
 # ----------------------------- AI 宿主接口 -----------------------------
@@ -615,6 +706,7 @@ def make_host():
         return market_state(next(s for s in SYMBOLS if s["code"] == code)["market"], time.time())
     return {
         "symbols": SYMBOLS, "fee_rate": FEE_RATE,
+        "fee": fee_for, "dirty": dirty,
         "quote": lambda c: (dict(E["quotes"][c]) if c in E["quotes"] else None),
         "ticks": lambda c, n: list(E["ticks"].get(c, [])[-n:]),
         "account": account_snapshot,
@@ -656,7 +748,24 @@ class Handler(BaseHTTPRequestHandler):
                 lim = min(100000, max(1, int(q.get("limit", ["50"])[0] or 50)))
                 return self._json(list_trades(off, lim))
             if u.path == "/api/health":
-                return self._json({"ok": True, "ai": AI is not None})
+                return self._json({"ok": True, "ai": AI is not None, "persist": bool(PERSIST)})
+            if u.path == "/api/fast":
+                return self._json(build_fast())
+            if u.path == "/api/persist":
+                return self._json(PERSIST.status() if PERSIST else {"error": "持久化模块未加载"})
+            if u.path == "/api/backup":
+                data = json.dumps(dict(export_state(), saved_at=int(time.time() * 1000), version=2), ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="quant_state_%s.json"' % time.strftime("%Y%m%d_%H%M%S"))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if u.path == "/api/indicators":
+                if not AI:
+                    return self._json({"ok": False, "error": "AI/指标模块未加载(缺少 numpy?)"}, 503)
+                return self._json(AI.indicators(q.get("code", [""])[0], q.get("tf", ["5m"])[0]))
             if u.path == "/api/history":
                 if not AI:
                     return self._json({"ok": False, "error": "AI/历史模块未加载(缺少 numpy?)"}, 503)
@@ -709,6 +818,14 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/reset":
                 reset_account()
                 return self._json({"ok": True})
+            if u.path == "/api/restore":
+                if not isinstance(body, dict) or not body.get("sql"):
+                    return self._json({"ok": False, "error": "不是有效的备份文件(缺少 sql 段)"}, 400)
+                import_state(body)
+                dirty(True)
+                return self._json({"ok": True, "trades": len((body.get("sql") or {}).get("trades") or [])})
+            if u.path == "/api/persist/save":
+                return self._json(dict(PERSIST.save_now(force=True), ok=True) if PERSIST else {"ok": False, "error": "持久化模块未加载"})
             return self._send(404, "not found", "text/plain; charset=utf-8")
         except Exception as ex:
             return self._json({"ok": False, "error": str(ex)}, 500)
@@ -720,10 +837,19 @@ class Server(ThreadingHTTPServer):
 
 
 def main():
-    global AI
+    global AI, PERSIST
     init_db()
     if ai_engine:
         AI = ai_engine.Engine(make_host())
+    if persist_mod:
+        PERSIST = persist_mod.Persist(os.path.dirname(DB_PATH) or HERE, export_state, import_state)
+        try:
+            print("♻ 恢复:", PERSIST.boot_restore(db_is_fresh()), flush=True)
+        except Exception as ex:
+            print("恢复出错:", ex, flush=True)
+        PERSIST.start()
+        print("☁ 云备份:", "已启用(GitHub Gist)" if PERSIST.token else "未配置 Token → 仅本会话/本地文件有效", flush=True)
+    if AI:
         AI.start()
     threading.Thread(target=poll_loop, daemon=True).start()
     httpd = Server(("0.0.0.0", PORT), Handler)
