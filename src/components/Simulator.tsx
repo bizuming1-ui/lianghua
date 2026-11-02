@@ -28,16 +28,17 @@ export default function Simulator() {
     setTimeout(() => setToast(""), 2200);
   };
 
-  async function copyFromPack(kind: "kaggle" | "github") {
+  async function copyFromPack(kind: "kaggle0" | "kaggle1" | "github") {
     setMenu(false);
     say("正在读取代码…");
     try {
       const pack = (await (await fetch("/api/code", { cache: "no-store" })).json()) as CodePack;
       let text: string;
-      if (kind === "kaggle") text = pack.kaggle[0].content;
+      if (kind === "kaggle0") text = pack.kaggle[0].content;
+      else if (kind === "kaggle1") text = pack.kaggle[1].content;
       else text = pack.github.map((f) => `// ===== ${f.path} =====\n${f.content}`).join("\n\n");
       const ok = await copyText(text);
-      say(ok ? (kind === "kaggle" ? "✔ 已复制 Kaggle Cell 1(直接粘贴运行)" : `✔ 已复制 GitHub 全部代码(${pack.github.length} 个文件)`) : "✘ 复制失败,请进入复制代码界面手动复制");
+      say(ok ? (kind === "kaggle0" ? "✔ 已复制 Kaggle Cell 0(双 T4 大模型,先运行)" : kind === "kaggle1" ? "✔ 已复制 Kaggle Cell 1(终端 + AI,第二个运行)" : `✔ 已复制 GitHub 全部代码(${pack.github.length} 个文件)`) : "✘ 复制失败,请进入复制代码界面手动复制");
     } catch {
       say("✘ 读取代码失败");
     }
@@ -67,9 +68,13 @@ export default function Simulator() {
           </button>
           {menu && (
             <div className="absolute right-0 top-full z-20 mt-1 w-72 overflow-hidden rounded-xl border border-[#1b2738] bg-[#0b121b] shadow-2xl">
-              <button onClick={() => copyFromPack("kaggle")} className="block w-full px-4 py-3 text-left text-sm hover:bg-[#12202f]">
-                <b className="text-emerald-400">一键复制 Kaggle 代码</b>
-                <span className="block text-xs text-slate-400">Cell 1:粘贴到 Kaggle Notebook 直接运行</span>
+              <button onClick={() => copyFromPack("kaggle0")} className="block w-full px-4 py-3 text-left text-sm hover:bg-[#12202f]">
+                <b className="text-fuchsia-400">① 复制 Kaggle Cell 0 · 双 T4 大模型</b>
+                <span className="block text-xs text-slate-400">先运行:vLLM 张量并行,两张卡同时推理</span>
+              </button>
+              <button onClick={() => copyFromPack("kaggle1")} className="block w-full border-t border-[#1b2738] px-4 py-3 text-left text-sm hover:bg-[#12202f]">
+                <b className="text-emerald-400">② 复制 Kaggle Cell 1 · 终端 + AI</b>
+                <span className="block text-xs text-slate-400">再运行:行情 + 模拟交易 + AI 决策 + 公网网址</span>
               </button>
               <button onClick={() => copyFromPack("github")} className="block w-full border-t border-[#1b2738] px-4 py-3 text-left text-sm hover:bg-[#12202f]">
                 <b className="text-sky-400">一键复制 GitHub 全部代码</b>
