@@ -1,35 +1,2877 @@
 # ==========================================================================
-#  Cell 2(可选):查看运行状态 / 重新打印网址 / 看日志
-#  需要关闭服务时,把最后一行的 STOP 改成 True
+#  生物科技ETF 量化终端 + AI 推理决策 · Kaggle 一键启动(Cell 1)
+#  建议顺序:先运行 Cell 0(双 T4 部署大模型),再运行本单元;没有 Cell 0 时仍可用规则策略
+#  使用前提:Notebook 右侧 Settings → Internet 必须是 ON(行情和公网网址都需要联网)
+#  运行后:下方会打印一个 https://xxxx.trycloudflare.com 网址,点开就是量化终端
+#  说明:服务以后台进程运行,本单元运行完即返回;会话不关闭,网站就一直在线
 # ==========================================================================
-import os, json, subprocess, urllib.request
+import os, sys, re, time, subprocess, urllib.request
 
 ROOT = os.environ.get("QUANT_ROOT", "/kaggle/working/quant")
 PORT = int(os.environ.get("QUANT_PORT", "8000"))
-STOP = False
+os.makedirs(ROOT, exist_ok=True)
 
-try:
-    s = json.load(urllib.request.urlopen("http://127.0.0.1:%d/api/state?since=9999999999999" % PORT, timeout=3))
-    print("后端运行中 · 行情源:", s["feed"]["name"], "· 延迟", s["feed"]["latency"], "ms")
-    for q in s["quotes"]:
-        print("  %-7s %-10s %+7.2f%%  %s  [%s]" % (q["code"], q["price"], q["pct"] or 0, q["stateLabel"], q["feed"]))
-    a, st = s["account"], s["stats"]
-    print("账户权益 ¥%.2f · 现金 ¥%.2f · 成交 %d 笔 · 胜率 %s" % (
-        a["equity"], a["cash"], st["trades"], "--" if st["winRate"] is None else "%.1f%%" % st["winRate"]))
-except Exception as ex:
-    print("后端未运行:", ex, "→ 请先运行 Cell 1")
+SERVER_PY = r'''#!/usr/bin/env python3
+"""
+生物科技ETF 量化终端 - Kaggle / 本地 Python 版后端(零第三方依赖)
 
+与 Next.js 版(src/lib/quant/*)实现同一套接口:
+  GET  /               量化终端页面(index.html)
+  GET  /api/state      行情 + 指标 + 账户 + 持仓 + 胜率 + 最近成交(1 秒轮询)
+  GET  /api/trades     成交日志分页
+  POST /api/trade      模拟下单   {symbol, side, qty}
+  POST /api/auto       自动策略开关 {enabled}
+  POST /api/reset      重置账户(10000 元)
+  GET  /api/health     健康检查
+
+行情源:新浪(主) -> 腾讯(备);全部失败时才使用明确标注的"模拟行情"。
+存储:SQLite(默认 /kaggle/working/quant.db,否则当前目录)。
+"""
+import json
+import math
+import os
+import random
+import re
+import sqlite3
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# 前端单文件:Kaggle 单元把它与 server.py 放在同目录;GitHub 仓库里位于 public/terminal/
+INDEX_PATH = next(
+    (p for p in (os.path.join(HERE, "index.html"),
+                 os.path.join(HERE, "..", "public", "terminal", "index.html")) if os.path.exists(p)),
+    os.path.join(HERE, "index.html"),
+)
+DB_PATH = os.environ.get("QUANT_DB") or (
+    "/kaggle/working/quant.db" if os.path.isdir("/kaggle/working") else os.path.join(HERE, "quant.db")
+)
+PORT = int(os.environ.get("PORT", "8000"))
+
+# AI 推理模块(numpy + ai_engine.py + quant_math.py);缺失时其余功能照常运行
+sys.path.insert(0, HERE)
 try:
-    print("网址:", open(os.path.join(ROOT, "url.txt")).read())
+    import ai_engine
+except Exception as _ex:  # pragma: no cover
+    ai_engine = None
+    print("AI 模块不可用:", _ex, file=sys.stderr, flush=True)
+AI = None
+
+# ----------------------------- 配置(与 config.ts 保持一致) -----------------------------
+SYMBOLS = [
+    {"code": "IBB", "name": "生物科技指数ETF-iShares Nasdaq", "short": "iShares Nasdaq Biotech", "market": "US",
+     "currency": "USD", "lot": 1, "decimals": 2, "sina": "gb_ibb", "tencent": "usIBB", "base": 217.6},
+    {"code": "XBI", "name": "美国生科ETF-SPDR", "short": "SPDR S&P Biotech", "market": "US",
+     "currency": "USD", "lot": 1, "decimals": 2, "sina": "gb_xbi", "tencent": "usXBI", "base": 156.0},
+    {"code": "159502", "name": "标普生物科技ETF嘉实", "short": "嘉实标普生物科技", "market": "CN",
+     "currency": "CNY", "lot": 100, "decimals": 3, "sina": "sz159502", "tencent": "sz159502", "base": 1.62},
+]
+INITIAL_CAPITAL = 10000.0
+FEE_RATE = 0.0003
+TICK_MAX = 7200
+POLL_S = 1.0
+DEFAULT_FX = 7.2
+MA_FAST, MA_SLOW, RSI_N, BOLL_N, BOLL_K = 30, 120, 60, 120, 2
+TAKE_PROFIT, STOP_LOSS = 0.012, 0.008
+AUTO_COOLDOWN_S, AUTO_CASH_FRACTION = 30.0, 0.5
+
+# ----------------------------- 时区 / 市场时段 -----------------------------
+CN_TZ = timezone(timedelta(hours=8))
+try:
+    from zoneinfo import ZoneInfo
+    US_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover
+    try:
+        from dateutil import tz as _tz
+        US_TZ = _tz.gettz("America/New_York") or timezone(timedelta(hours=-5))
+    except Exception:
+        US_TZ = timezone(timedelta(hours=-5))
+TZ = {"US": US_TZ, "CN": CN_TZ}
+STATE_LABEL = {"open": "交易中", "pre": "盘前", "post": "盘后", "lunch": "午休", "closed": "休市"}
+
+
+def market_state(market, now_s):
+    d = datetime.fromtimestamp(now_s, TZ[market])
+    if d.weekday() >= 5:
+        return "closed"
+    t = d.hour * 60 + d.minute
+    if market == "US":
+        if 570 <= t < 960:
+            return "open"
+        if 240 <= t < 570:
+            return "pre"
+        if 960 <= t < 1200:
+            return "post"
+        return "closed"
+    if 570 <= t < 690 or 780 <= t < 900:
+        return "open"
+    if 690 <= t < 780:
+        return "lunch"
+    if 555 <= t < 570:
+        return "pre"
+    return "closed"
+
+
+def zoned_ms(y, mo, d, hh, mi, ss, market):
+    return datetime(y, mo, d, hh, mi, ss, tzinfo=TZ[market]).timestamp() * 1000
+
+
+# ----------------------------- 行情源 -----------------------------
+def http_text(url, headers):
+    h = {"User-Agent": "Mozilla/5.0 (quant-terminal)"}
+    h.update(headers)
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=2.5) as r:
+        return r.read().decode("gb18030", "replace")
+
+
+def num(s):
+    try:
+        v = float(s)
+        return v if math.isfinite(v) else 0.0
+    except Exception:
+        return 0.0
+
+
+def parse_cn_time(date_s, time_s, fallback_ms):
+    try:
+        y, mo, d = [int(x) for x in date_s.split("-")]
+        hh, mi, ss = [int(x) for x in time_s.split(":")]
+        return zoned_ms(y, mo, d, hh, mi, ss, "CN")
+    except Exception:
+        return fallback_ms
+
+
+def fetch_sina():
+    lst = ",".join([s["sina"] for s in SYMBOLS] + ["fx_susdcny"])
+    text = http_text("https://hq.sinajs.cn/list=" + lst, {"Referer": "https://finance.sina.com.cn"})
+    mp = {}
+    for m in re.finditer(r'hq_str_(\w+)="([^"]*)"', text):
+        mp[m.group(1)] = m.group(2).split(",")
+    now_ms = time.time() * 1000
+    quotes = {}
+    for s in SYMBOLS:
+        f = mp.get(s["sina"])
+        if not f or len(f) < 10:
+            continue
+        if s["market"] == "US":
+            price = num(f[1])
+            prev = num(f[26]) if len(f) > 26 else 0
+            st = market_state("US", time.time())
+            ext = num(f[21]) if len(f) > 21 else 0
+            if st in ("pre", "post") and ext > 0:
+                price = ext
+            if price <= 0:
+                continue
+            try:
+                ds, ts = f[3].split(" ")
+                qt = parse_cn_time(ds, ts, now_ms)
+            except Exception:
+                qt = now_ms
+            quotes[s["code"]] = {"code": s["code"], "price": price, "prevClose": prev if prev > 0 else price,
+                                 "open": num(f[5]) or price, "high": num(f[6]) or price, "low": num(f[7]) or price,
+                                 "quoteTime": qt, "feed": "sina"}
+        else:
+            price = num(f[3])
+            prev = num(f[2])
+            if price <= 0:
+                price = prev
+            if price <= 0:
+                continue
+            quotes[s["code"]] = {"code": s["code"], "price": price, "prevClose": prev if prev > 0 else price,
+                                 "open": num(f[1]) or price, "high": num(f[4]) or price, "low": num(f[5]) or price,
+                                 "quoteTime": parse_cn_time(f[30], f[31], now_ms) if len(f) > 31 else now_ms,
+                                 "feed": "sina"}
+    fxr = mp.get("fx_susdcny")
+    fx = num(fxr[1]) if fxr and len(fxr) > 1 and num(fxr[1]) > 5 else None
+    return {"quotes": quotes, "fx": fx}
+
+
+def fetch_tencent():
+    text = http_text("https://qt.gtimg.cn/q=" + ",".join(s["tencent"] for s in SYMBOLS),
+                     {"Referer": "https://gu.qq.com"})
+    quotes = {}
+    now_ms = time.time() * 1000
+    for s in SYMBOLS:
+        m = re.search(r'v_%s="([^"]*)"' % re.escape(s["tencent"]), text)
+        if not m:
+            continue
+        f = m.group(1).split("~")
+        if len(f) < 35:
+            continue
+        price = num(f[3])
+        if price <= 0:
+            continue
+        ts = f[30]
+        qt = now_ms
+        a = re.match(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$", ts)
+        b = re.match(r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$", ts)
+        mm = a or b
+        if mm:
+            qt = zoned_ms(*[int(x) for x in mm.groups()], s["market"])
+        quotes[s["code"]] = {"code": s["code"], "price": price, "prevClose": num(f[4]) or price,
+                             "open": num(f[5]) or price, "high": num(f[33]) or price, "low": num(f[34]) or price,
+                             "quoteTime": qt, "feed": "tencent"}
+    return {"quotes": quotes, "fx": None}
+
+
+def fetch_yahoo_fx():
+    req = urllib.request.Request("https://query1.finance.yahoo.com/v8/finance/chart/CNY=X?interval=1m&range=1d",
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=2.5) as r:
+        j = json.loads(r.read().decode("utf-8"))
+    p = j["chart"]["result"][0]["meta"]["regularMarketPrice"]
+    return p if isinstance(p, (int, float)) and p > 5 else None
+
+
+# ----------------------------- 指标(与 indicators.ts 一致) -----------------------------
+def rsi_calc(prices, n):
+    if len(prices) < n + 1:
+        return None
+    w = prices[-(n + 1):]
+    up = dn = 0.0
+    for i in range(1, len(w)):
+        d = w[i] - w[i - 1]
+        if d > 0:
+            up += d
+        else:
+            dn -= d
+    if up + dn == 0:
+        return 50.0
+    return 100.0 * up / (up + dn)
+
+
+def analyze(prices):
+    sig = {"ready": False, "warm": len(prices), "need": MA_SLOW, "maFast": None, "maSlow": None, "rsi": None,
+           "bollUp": None, "bollMid": None, "bollLow": None, "score": 0, "action": "HOLD", "reasons": []}
+    if len(prices) < MA_SLOW:
+        return sig
+    last = prices[-1]
+    ma_fast = sum(prices[-MA_FAST:]) / MA_FAST
+    ma_slow = sum(prices[-MA_SLOW:]) / MA_SLOW
+    bw = prices[-BOLL_N:]
+    bm = sum(bw) / len(bw)
+    bs = math.sqrt(sum((v - bm) ** 2 for v in bw) / len(bw))
+    r = rsi_calc(prices, RSI_N)
+    sig.update(ready=True, maFast=ma_fast, maSlow=ma_slow, rsi=r, bollMid=bm,
+               bollUp=bm + BOLL_K * bs, bollLow=bm - BOLL_K * bs)
+    score = 0
+    rel = (ma_fast - ma_slow) / ma_slow
+    if rel > 0.0002:
+        score += 1
+        sig["reasons"].append("MA30 在 MA120 之上(趋势向上)")
+    elif rel < -0.0002:
+        score -= 1
+        sig["reasons"].append("MA30 在 MA120 之下(趋势向下)")
+    if r is not None:
+        if r < 30:
+            score += 1
+            sig["reasons"].append("RSI 超卖(<30)")
+        elif r > 70:
+            score -= 1
+            sig["reasons"].append("RSI 超买(>70)")
+    if bs > 0:
+        if last < sig["bollLow"]:
+            score += 1
+            sig["reasons"].append("价格跌破布林下轨")
+        elif last > sig["bollUp"]:
+            score -= 1
+            sig["reasons"].append("价格突破布林上轨")
+    sig["score"] = score
+    sig["action"] = "BUY" if score >= 2 else ("SELL" if score <= -1 else "HOLD")
+    return sig
+
+
+# ----------------------------- 状态 / 数据库 -----------------------------
+LOCK = threading.RLock()
+E = {
+    "epoch": int(time.time() * 1000), "ticks": {}, "quotes": {}, "signals": {},
+    "fx": {"rate": DEFAULT_FX, "src": "default", "at": 0},
+    "feed": {"name": "-", "ok": False, "latency": 0, "lastOkAt": 0, "error": "starting"},
+    "auto": False, "auto_mode": 0, "last_auto": {},
+}
+DB = sqlite3.connect(DB_PATH, check_same_thread=False)
+DB.row_factory = sqlite3.Row
+
+
+def r2(v):
+    return math.floor(v * 100 + 0.5) / 100
+
+
+def r4(v):
+    return math.floor(v * 10000 + 0.5) / 10000
+
+
+def init_db():
+    with LOCK:
+        DB.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS account(id INTEGER PRIMARY KEY, cash REAL, initial REAL, auto INTEGER, started_at INTEGER);
+            CREATE TABLE IF NOT EXISTS positions(symbol TEXT PRIMARY KEY, qty INTEGER, cost REAL);
+            CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, symbol TEXT, side TEXT,
+              qty INTEGER, price REAL, currency TEXT, fx REAL, amount REAL, fee REAL, pnl REAL, pnl_pct REAL,
+              source TEXT, feed TEXT, note TEXT);
+            """
+        )
+        if not DB.execute("SELECT 1 FROM account WHERE id=1").fetchone():
+            DB.execute("INSERT INTO account VALUES(1,?,?,0,?)", (INITIAL_CAPITAL, INITIAL_CAPITAL, int(time.time() * 1000)))
+        DB.commit()
+        E["auto_mode"] = int(DB.execute("SELECT auto FROM account WHERE id=1").fetchone()[0] or 0)
+        E["auto"] = E["auto_mode"] == 1
+
+
+def trade_row(r):
+    return {"id": r["id"], "ts": r["ts"], "symbol": r["symbol"], "side": r["side"], "qty": r["qty"], "price": r["price"],
+            "currency": r["currency"], "fx": r["fx"], "amountCny": r["amount"], "feeCny": r["fee"], "pnlCny": r["pnl"],
+            "pnlPct": r["pnl_pct"], "source": r["source"], "feed": r["feed"], "note": r["note"] or ""}
+
+
+def fx_for(sym):
+    return 1.0 if sym["currency"] == "CNY" else E["fx"]["rate"]
+
+
+def execute(code, side, qty, source, extra_note=""):
+    sym = next((s for s in SYMBOLS if s["code"] == code), None)
+    if not sym:
+        return {"ok": False, "error": "未知标的"}
+    if not isinstance(qty, int) or qty <= 0:
+        return {"ok": False, "error": "数量必须是正整数"}
+    if qty % sym["lot"] != 0:
+        return {"ok": False, "error": "%s 最小交易单位为 %d" % (code, sym["lot"])}
+    with LOCK:
+        q = E["quotes"].get(code)
+        if not q or q["price"] <= 0:
+            return {"ok": False, "error": "暂无行情,无法成交"}
+        price = q["price"]
+        fx = fx_for(sym)
+        amount = r2(price * qty * fx)
+        fee = r2(amount * FEE_RATE)
+        now_ms = int(time.time() * 1000)
+        notes = [extra_note] if extra_note else []
+        st = market_state(sym["market"], time.time())
+        if st != "open":
+            notes.append("%s·按最近价成交" % STATE_LABEL[st])
+        if q["feed"] == "sim":
+            notes.append("模拟行情")
+        if q["feed"] == "stale":
+            notes.append("行情延迟")
+        acc = DB.execute("SELECT * FROM account WHERE id=1").fetchone()
+        pos = DB.execute("SELECT * FROM positions WHERE symbol=?", (code,)).fetchone()
+        cur_qty = pos["qty"] if pos else 0
+        cur_cost = pos["cost"] if pos else 0.0
+        pnl = pnl_pct = None
+        if side == "BUY":
+            need = r2(amount + fee)
+            if acc["cash"] + 1e-9 < need:
+                return {"ok": False, "error": "资金不足:需要 ¥%s,可用 ¥%s" % (need, r2(acc["cash"]))}
+            DB.execute("UPDATE account SET cash=? WHERE id=1", (r4(acc["cash"] - need),))
+            DB.execute("INSERT INTO positions(symbol,qty,cost) VALUES(?,?,?) ON CONFLICT(symbol) DO UPDATE SET qty=excluded.qty, cost=excluded.cost",
+                       (code, cur_qty + qty, r4(cur_cost + need)))
+        else:
+            if cur_qty < qty:
+                return {"ok": False, "error": "持仓不足:持有 %d,欲卖 %d" % (cur_qty, qty)}
+            proceeds = r2(amount - fee)
+            cost_part = cur_cost * (qty / cur_qty)
+            pnl = r2(proceeds - cost_part)
+            pnl_pct = pnl / cost_part if cost_part > 0 else 0.0
+            DB.execute("UPDATE account SET cash=? WHERE id=1", (r4(acc["cash"] + proceeds),))
+            DB.execute("UPDATE positions SET qty=?, cost=? WHERE symbol=?",
+                       (cur_qty - qty, 0 if cur_qty - qty == 0 else r4(cur_cost - cost_part), code))
+        cur = DB.execute(
+            "INSERT INTO trades(ts,symbol,side,qty,price,currency,fx,amount,fee,pnl,pnl_pct,source,feed,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now_ms, code, side, qty, price, sym["currency"], fx, amount, fee, pnl, pnl_pct, source, q["feed"], ";".join(notes)))
+        DB.commit()
+        row = DB.execute("SELECT * FROM trades WHERE id=?", (cur.lastrowid,)).fetchone()
+        return {"ok": True, "trade": trade_row(row)}
+
+
+def run_strategy():
+    now = time.time()
+    acc = DB.execute("SELECT cash FROM account WHERE id=1").fetchone()
+    cash = acc["cash"]
+    poss = {r["symbol"]: r for r in DB.execute("SELECT * FROM positions")}
+    for s in SYMBOLS:
+        q = E["quotes"].get(s["code"])
+        sig = E["signals"].get(s["code"])
+        if not q or not sig or not sig["ready"]:
+            continue
+        if q["feed"] not in ("sina", "tencent"):
+            continue
+        if market_state(s["market"], now) != "open":
+            continue
+        if now - E["last_auto"].get(s["code"], 0) < AUTO_COOLDOWN_S:
+            continue
+        fx = fx_for(s)
+        pos = poss.get(s["code"])
+        if pos and pos["qty"] > 0:
+            mv = q["price"] * fx * pos["qty"]
+            ret = (mv - pos["cost"]) / pos["cost"] if pos["cost"] > 0 else 0
+            if ret >= TAKE_PROFIT or ret <= -STOP_LOSS or sig["action"] == "SELL":
+                r = execute(s["code"], "SELL", pos["qty"], "auto")
+                if r["ok"]:
+                    E["last_auto"][s["code"]] = now
+                    cash += r["trade"]["amountCny"]
+        elif sig["action"] == "BUY":
+            unit = q["price"] * fx * (1 + FEE_RATE) * s["lot"]
+            lots = int((cash * AUTO_CASH_FRACTION) // unit)
+            if lots >= 1:
+                r = execute(s["code"], "BUY", lots * s["lot"], "auto")
+                if r["ok"]:
+                    E["last_auto"][s["code"]] = now
+                    cash -= r["trade"]["amountCny"] + r["trade"]["feeCny"]
+
+
+# ----------------------------- 轮询线程 -----------------------------
+def apply_real(sym, raw, now_ms):
+    prev = E["quotes"].get(sym["code"])
+    if prev and prev["feed"] == "sim":
+        E["ticks"][sym["code"]] = []
+    E["quotes"][sym["code"]] = dict(raw, lastOk=now_ms)
+
+
+def apply_fallback(sym, now_ms):
+    q = E["quotes"].get(sym["code"])
+    if q and q["feed"] != "sim":
+        if now_ms - q["lastOk"] > 10000:
+            q["feed"] = "stale"
+        return
+    base = q["price"] if q else sym["base"]
+    price = base * (1 + (random.random() - 0.5) * 0.0012)
+    price = round(price, sym["decimals"])
+    E["quotes"][sym["code"]] = {
+        "code": sym["code"], "price": price, "prevClose": q["prevClose"] if q else sym["base"],
+        "open": q["open"] if q else sym["base"], "high": max(q["high"] if q else price, price),
+        "low": min(q["low"] if q else price, price), "quoteTime": now_ms, "feed": "sim", "lastOk": now_ms}
+
+
+def poll():
+    t0 = time.time()
+    res, name, err = None, "sina", ""
+    try:
+        res = fetch_sina()
+    except Exception as ex:
+        err = "sina: %s" % ex
+
+    def missing():
+        return [s for s in SYMBOLS if not res or s["code"] not in res["quotes"]]
+
+    if not res or missing():
+        try:
+            t = fetch_tencent()
+            if not res:
+                res, name = t, "tencent"
+            else:
+                for s in missing():
+                    if s["code"] in t["quotes"]:
+                        res["quotes"][s["code"]] = t["quotes"][s["code"]]
+                name = "sina+tencent"
+        except Exception as ex:
+            err += " tencent: %s" % ex
+    now_ms = int(time.time() * 1000)
+    with LOCK:
+        got = bool(res and res["quotes"])
+        if got:
+            E["feed"] = {"name": name, "ok": True, "latency": now_ms - int(t0 * 1000), "lastOkAt": now_ms, "error": ""}
+        else:
+            E["feed"] = dict(E["feed"], name=name, ok=False, latency=now_ms - int(t0 * 1000), error=err or "no data")
+        if res and res.get("fx"):
+            E["fx"] = {"rate": res["fx"], "src": "sina", "at": now_ms}
+    if not (res and res.get("fx")) and now_ms - E["fx"]["at"] > 60000:
+        E["fx"]["at"] = now_ms
+        try:
+            y = fetch_yahoo_fx()
+            if y:
+                E["fx"] = {"rate": y, "src": "yahoo", "at": now_ms}
+        except Exception:
+            pass
+    sec = now_ms // 1000 * 1000
+    with LOCK:
+        for s in SYMBOLS:
+            raw = res["quotes"].get(s["code"]) if res else None
+            if raw:
+                apply_real(s, raw, now_ms)
+            else:
+                apply_fallback(s, now_ms)
+            q = E["quotes"][s["code"]]
+            arr = E["ticks"].setdefault(s["code"], [])
+            if not arr or arr[-1][0] < sec:
+                arr.append([sec, q["price"]])
+                if len(arr) > TICK_MAX:
+                    del arr[: len(arr) - TICK_MAX]
+                E["signals"][s["code"]] = analyze([x[1] for x in arr[-200:]])
+        if E["auto_mode"] == 1:
+            run_strategy()
+    if AI:
+        try:
+            AI.on_tick()
+        except Exception as ex:
+            print("ai tick error:", ex, file=sys.stderr)
+
+
+def poll_loop():
+    while True:
+        t = time.time()
+        try:
+            poll()
+        except Exception as ex:  # 轮询失败不应让线程退出
+            print("poll error:", ex, file=sys.stderr)
+        time.sleep(max(0.05, POLL_S - (time.time() - t)))
+
+
+# ----------------------------- 对外查询 -----------------------------
+def build_state(since):
+    now_ms = int(time.time() * 1000)
+    with LOCK:
+        acc = DB.execute("SELECT * FROM account WHERE id=1").fetchone()
+        poss = DB.execute("SELECT * FROM positions").fetchall()
+        st = DB.execute(
+            "SELECT count(*) n, sum(side='BUY') buys, sum(side='SELL') sells, "
+            "sum(side='SELL' AND pnl>0) wins, coalesce(sum(pnl),0) realized, coalesce(sum(fee),0) fees FROM trades").fetchone()
+        n, buys, sells, wins = st["n"] or 0, st["buys"] or 0, st["sells"] or 0, st["wins"] or 0
+        recent = [trade_row(r) for r in DB.execute("SELECT * FROM trades ORDER BY id DESC LIMIT 40")]
+        quotes = []
+        for s in SYMBOLS:
+            q = E["quotes"].get(s["code"])
+            state = market_state(s["market"], time.time())
+            quotes.append({
+                "code": s["code"], "name": s["name"], "short": s["short"], "market": s["market"],
+                "currency": s["currency"], "lot": s["lot"], "decimals": s["decimals"],
+                "price": q["price"] if q else None, "prevClose": q["prevClose"] if q else None,
+                "open": q["open"] if q else None, "high": q["high"] if q else None, "low": q["low"] if q else None,
+                "change": (q["price"] - q["prevClose"]) if q else None,
+                "pct": ((q["price"] / q["prevClose"] - 1) * 100) if q and q["prevClose"] > 0 else None,
+                "quoteTime": q["quoteTime"] if q else None, "feed": q["feed"] if q else "none",
+                "state": state, "stateLabel": STATE_LABEL[state]})
+        mv = cost = 0.0
+        pos_out = []
+        for p in poss:
+            if p["qty"] <= 0:
+                continue
+            s = next(x for x in SYMBOLS if x["code"] == p["symbol"])
+            q = E["quotes"].get(p["symbol"])
+            fx = fx_for(s)
+            value = q["price"] * fx * p["qty"] if q else 0.0
+            mv += value
+            cost += p["cost"]
+            pos_out.append({"symbol": p["symbol"], "qty": p["qty"], "costCny": p["cost"],
+                            "avgPrice": p["cost"] / (p["qty"] * fx), "mvCny": value, "pnlCny": value - p["cost"],
+                            "pnlPct": (value - p["cost"]) / p["cost"] if p["cost"] > 0 else 0})
+        equity = acc["cash"] + mv
+        ticks = {s["code"]: [t for t in E["ticks"].get(s["code"], []) if t[0] > since] for s in SYMBOLS}
+        return {
+            "ts": now_ms, "epoch": E["epoch"], "quotes": quotes, "ticks": ticks, "signals": E["signals"],
+            "fx": E["fx"], "feed": E["feed"],
+            "account": {"cash": acc["cash"], "initial": acc["initial"], "equity": equity, "marketValue": mv,
+                        "unrealized": mv - cost, "realized": st["realized"], "fees": st["fees"],
+                        "returnPct": (equity / acc["initial"] - 1) * 100, "auto": bool(acc["auto"]), "autoMode": {0: "off", 1: "rule", 2: "ai"}.get(int(acc["auto"] or 0), "off"),
+                        "startedAt": acc["started_at"]},
+            "positions": pos_out,
+            "stats": {"trades": n, "buys": buys, "sells": sells, "wins": wins, "losses": sells - wins,
+                      "winRate": (wins / sells * 100) if sells > 0 else None},
+            "trades": recent}
+
+
+def list_trades(offset, limit):
+    with LOCK:
+        total = DB.execute("SELECT count(*) FROM trades").fetchone()[0]
+        rows = DB.execute("SELECT * FROM trades ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        return {"total": total, "rows": [trade_row(r) for r in rows]}
+
+
+def set_auto(mode):
+    """mode: 0 关闭 / 1 规则策略 / 2 AI 推理策略"""
+    mode = int(mode)
+    with LOCK:
+        DB.execute("UPDATE account SET auto=? WHERE id=1", (mode,))
+        DB.commit()
+        E["auto_mode"] = mode
+        E["auto"] = mode == 1
+
+
+def reset_account():
+    with LOCK:
+        DB.execute("DELETE FROM trades")
+        DB.execute("DELETE FROM positions")
+        DB.execute("UPDATE account SET cash=?, initial=?, auto=0, started_at=? WHERE id=1",
+                   (INITIAL_CAPITAL, INITIAL_CAPITAL, int(time.time() * 1000)))
+        DB.commit()
+        E["auto"] = False
+        E["auto_mode"] = 0
+        E["last_auto"] = {}
+        if AI:
+            AI.plans.clear()
+            AI.last_trade.clear()
+
+
+# ----------------------------- AI 宿主接口 -----------------------------
+def account_snapshot():
+    with LOCK:
+        acc = DB.execute("SELECT * FROM account WHERE id=1").fetchone()
+        poss = {r["symbol"]: {"qty": r["qty"], "cost": r["cost"]} for r in DB.execute("SELECT * FROM positions") if r["qty"] > 0}
+        mv = 0.0
+        for code, p in poss.items():
+            s = next(x for x in SYMBOLS if x["code"] == code)
+            q = E["quotes"].get(code)
+            if q:
+                mv += q["price"] * fx_for(s) * p["qty"]
+        since = int((time.time() - 86400) * 1000)
+        pnl = DB.execute("SELECT coalesce(sum(pnl),0) FROM trades WHERE source='ai' AND ts>=?", (since,)).fetchone()[0]
+        return {"cash": acc["cash"], "initial": acc["initial"], "equity": acc["cash"] + mv, "positions": poss, "ai_pnl_24h": pnl}
+
+
+def make_host():
+    def state_of(code):
+        return market_state(next(s for s in SYMBOLS if s["code"] == code)["market"], time.time())
+    return {
+        "symbols": SYMBOLS, "fee_rate": FEE_RATE,
+        "quote": lambda c: (dict(E["quotes"][c]) if c in E["quotes"] else None),
+        "ticks": lambda c, n: list(E["ticks"].get(c, [])[-n:]),
+        "account": account_snapshot,
+        "place": lambda code, side, qty, source, note="": execute(code, side, qty, source, note),
+        "market_state": state_of, "fx": fx_for, "auto_mode": lambda: E["auto_mode"],
+    }
+
+
+# ----------------------------- HTTP -----------------------------
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj, ensure_ascii=False, separators=(",", ":")))
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        try:
+            if u.path in ("/", "/site", "/index.html"):
+                with open(INDEX_PATH, "rb") as f:
+                    return self._send(200, f.read(), "text/html; charset=utf-8")
+            if u.path == "/api/state":
+                return self._json(build_state(int(float(q.get("since", ["0"])[0] or 0))))
+            if u.path == "/api/trades":
+                off = max(0, int(q.get("offset", ["0"])[0] or 0))
+                lim = min(100000, max(1, int(q.get("limit", ["50"])[0] or 50)))
+                return self._json(list_trades(off, lim))
+            if u.path == "/api/health":
+                return self._json({"ok": True, "ai": AI is not None})
+            if u.path == "/api/history":
+                if not AI:
+                    return self._json({"ok": False, "error": "AI/历史模块未加载(缺少 numpy?)"}, 503)
+                return self._json(AI.history_bars(q.get("code", [""])[0], q.get("tf", ["5m"])[0]))
+            if u.path == "/api/ai/state":
+                if not AI:
+                    return self._json({"available": False, "reason": "AI 模块未加载(缺少 numpy 或 ai_engine.py)"})
+                return self._json(AI.state(full=q.get("full", ["0"])[0] == "1"))
+            return self._send(404, "not found", "text/plain; charset=utf-8")
+        except Exception as ex:
+            return self._json({"error": str(ex)}, 500)
+
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}") if n else {}
+        except Exception:
+            return self._json({"ok": False, "error": "请求格式错误"}, 400)
+        try:
+            if u.path == "/api/trade":
+                side = str(body.get("side", "")).upper()
+                if side not in ("BUY", "SELL"):
+                    return self._json({"ok": False, "error": "side 必须是 BUY 或 SELL"}, 400)
+                qty = body.get("qty")
+                try:
+                    qty = int(qty)
+                except Exception:
+                    qty = 0
+                r = execute(str(body.get("symbol", "")), side, qty, "manual")
+                return self._json(r, 200 if r["ok"] else 400)
+            if u.path == "/api/auto":
+                mode = str(body.get("mode") or ("rule" if body.get("enabled") else "off")).lower()
+                if mode not in ("off", "rule", "ai"):
+                    return self._json({"ok": False, "error": "mode 必须是 off/rule/ai"}, 400)
+                if mode == "ai":
+                    if not AI:
+                        return self._json({"ok": False, "error": "AI 模块未加载"}, 400)
+                    if not ai_engine.llm_health()["up"]:
+                        return self._json({"ok": False, "error": "大模型未就绪:请先运行 Cell 0(双卡 vLLM),看到『双卡同时工作』后再开启"}, 400)
+                set_auto({"off": 0, "rule": 1, "ai": 2}[mode])
+                return self._json({"ok": True, "mode": mode, "enabled": mode != "off"})
+            if u.path == "/api/ai/run":
+                if not AI:
+                    return self._json({"ok": False, "error": "AI 模块未加载"}, 400)
+                if not ai_engine.llm_health()["up"]:
+                    return self._json({"ok": False, "error": "大模型未就绪"}, 400)
+                AI.trigger(body.get("code") or None)
+                return self._json({"ok": True})
+            if u.path == "/api/reset":
+                reset_account()
+                return self._json({"ok": True})
+            return self._send(404, "not found", "text/plain; charset=utf-8")
+        except Exception as ex:
+            return self._json({"ok": False, "error": str(ex)}, 500)
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main():
+    global AI
+    init_db()
+    if ai_engine:
+        AI = ai_engine.Engine(make_host())
+        AI.start()
+    threading.Thread(target=poll_loop, daemon=True).start()
+    httpd = Server(("0.0.0.0", PORT), Handler)
+    print("量化终端已启动: http://127.0.0.1:%d  (数据库 %s)" % (PORT, DB_PATH), flush=True)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+AI_PY = r'''"""
+AI 推理决策引擎(Kaggle T4×2 上的 vLLM 大模型 + 量化数学闸门)
+
+数据流(全部真实数据,绝不编造):
+  Yahoo Finance(美股/宏观 K 线、新闻标题) + 东方财富(159502 K 线) + 新浪/腾讯(秒级实时价,由 server.py 提供)
+    -> quant_math:波动率 / 状态识别 / 岭回归 + 样本外检验 / 跨市场隔夜模型
+    -> 提示词 -> vLLM(Qwen3 思考模式,双卡张量并行)-> JSON 决策
+    -> 数学闸门(样本外必须有统计优势、预期净收益 > 成本×1.5、置信度、风控、冷却)-> 下单
+原则:大模型只能"否决/缩小",不能越过数学闸门"无中生有"。
+"""
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+import quant_math as qm
+
+LLM_URL = os.environ.get("QUANT_LLM_URL", "http://127.0.0.1:8001/v1")
+LLM_NAME = os.environ.get("QUANT_LLM_NAME", "quant-llm")
+AI_INTERVAL = float(os.environ.get("QUANT_AI_INTERVAL", "90"))
+AI_CLOSED_INTERVAL = 600.0
+MAX_TOKENS = int(os.environ.get("QUANT_AI_MAX_TOKENS", "3500"))
+THINKING = os.environ.get("QUANT_AI_THINKING", "1") != "0"
+
+CN_TZ = timezone(timedelta(hours=8))
+try:
+    from zoneinfo import ZoneInfo
+    US_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover
+    US_TZ = timezone(timedelta(hours=-5))
+TZ = {"US": US_TZ, "CN": CN_TZ}
+
+DATA_MAP = {"IBB": {"yahoo": "IBB", "em": "105.IBB"}, "XBI": {"yahoo": "XBI", "em": "107.XBI"}, "159502": {"em": "0.159502"}}
+TF_SEC = {"1m": 60, "5m": 300, "15m": 900, "1d": 86400}
+YH = {"1m": ("1m", "5d"), "5m": ("5m", "60d"), "15m": ("15m", "60d"), "1d": ("1d", "2y")}
+EM = {"1m": (1, 2400), "5m": (5, 3000), "15m": (15, 2000), "1d": (101, 600)}
+TTL = {"1m": 15, "5m": 45, "15m": 90, "1d": 900}
+CTX = {"SPY": ("SPY", "107.SPY"), "QQQ": ("QQQ", "105.QQQ"), "VIX": ("^VIX", None), "美债10Y收益率": ("^TNX", "171.US10Y"),
+       "美元指数": ("DX-Y.NYB", None), "XLV医疗": ("XLV", "107.XLV"), "USDCNY": ("CNY=X", "133.USDCNH")}
+SLIP = {"US": 0.0002, "CN": 0.0005}  # 单边滑点假设(仅用于闸门的保守成本估计)
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
+
+
+def log(*a):
+    print("[ai]", *a, file=sys.stderr, flush=True)
+
+
+def http_json(url, timeout=8, headers=None, retries=2):
+    err = None
+    for i in range(retries + 1):
+        try:
+            h = dict(UA)
+            h.update(headers or {})
+            with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        except Exception as ex:
+            err = ex
+            time.sleep(0.4 * (i + 1))
+    raise err
+
+
+# ----------------------------- K 线数据 -----------------------------
+_yh_block = 0.0
+
+
+def yahoo_bars(sym, interval, rng):
+    global _yh_block
+    if time.time() < _yh_block:
+        raise RuntimeError("yahoo 冷却中(近期被限流)")
+    j, err = None, None
+    for host in ("query2", "query1"):  # 429 时换主机重试
+        try:
+            j = http_json("https://%s.finance.yahoo.com/v8/finance/chart/%s?interval=%s&range=%s&includePrePost=false" % (
+                host, urllib.parse.quote(sym), interval, rng), retries=0)
+            break
+        except Exception as ex:
+            err = ex
+            time.sleep(1.0)
+    if j is None:
+        _yh_block = time.time() + 120
+        raise err
+    res = j["chart"]["result"][0]
+    ts, q = res.get("timestamp") or [], res["indicators"]["quote"][0]
+    out = []
+    for i, t in enumerate(ts):
+        o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
+        if None in (o, h, l, c):
+            continue
+        out.append([int(t) * 1000, float(o), float(h), float(l), float(c), float(q["volume"][i] or 0)])
+    return out
+
+
+def em_bars(secid, klt, lmt):
+    url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s&klt=%d&fqt=1&lmt=%d&end=20500101"
+           "&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57") % (secid, klt, lmt)
+    kl = http_json(url)["data"]["klines"]
+    out = []
+    for line in kl:
+        p = line.split(",")
+        s = p[0]
+        if len(s) > 10:  # 分钟线:东方财富时间为"K 线结束时刻",换算成开始时刻
+            d = datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=CN_TZ)
+            t = d.timestamp() * 1000 - klt * 60000
+        else:
+            # 日线:取标注日期的 12:00 UTC,这样无论按北京还是纽约时区换算,日期都与标注一致
+            t = (datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(hours=12)).timestamp() * 1000
+        out.append([int(t), float(p[1]), float(p[3]), float(p[4]), float(p[2]), float(p[5])])
+    return out
+
+
+class Data:
+    def __init__(self):
+        self.cache = {}
+        self.locks = {}
+        self.meta = {}  # 数据源状态
+        self.glock = threading.Lock()
+
+    def _lock(self, key):
+        with self.glock:
+            return self.locks.setdefault(key, threading.Lock())
+
+    def bars(self, code, tf, force=False):
+        key = (code, tf)
+        c = self.cache.get(key)
+        if c and not force and time.time() - c[0] < TTL[tf]:
+            return c[1]
+        with self._lock(key):
+            c = self.cache.get(key)
+            if c and not force and time.time() - c[0] < TTL[tf]:
+                return c[1]
+            try:
+                m = DATA_MAP[code]
+                b, src = [], ""
+                if "yahoo" in m:
+                    try:
+                        b, src = yahoo_bars(m["yahoo"], *YH[tf]), "yahoo"
+                    except Exception as ex:
+                        log("yahoo 失败,改用东方财富:", code, tf, ex)
+                if not b and "em" in m:
+                    b, src = em_bars(m["em"], *EM[tf]), "eastmoney"
+                if not b:
+                    raise ValueError("empty")
+                self.cache[key] = (time.time(), b)
+                self.meta[key] = {"src": src, "ok": True, "n": len(b), "at": int(time.time() * 1000), "err": ""}
+                return b
+            except Exception as ex:
+                self.meta[key] = dict(self.meta.get(key) or {}, ok=False, err=str(ex)[:120])
+                return c[1] if c else []
+
+    def raw(self, sym, interval, rng, ttl, em=None):
+        key = ("raw", sym, interval, rng)
+        c = self.cache.get(key)
+        if c and time.time() - c[0] < ttl:
+            return c[1]
+        with self._lock(key):
+            try:
+                try:
+                    b = yahoo_bars(sym, interval, rng)
+                except Exception:
+                    if not em:
+                        raise
+                    b = em_bars(em, 101, 150)
+                self.cache[key] = (time.time(), b)
+                return b
+            except Exception:
+                return c[1] if c else []
+
+
+def news_titles(sym):
+    try:
+        j = http_json("https://query2.finance.yahoo.com/v1/finance/search?q=%s&quotesCount=0&newsCount=6" % urllib.parse.quote(sym))
+        out = []
+        for n in j.get("news", [])[:6]:
+            ts = n.get("providerPublishTime")
+            out.append({"title": n.get("title", ""), "pub": n.get("publisher", ""), "ts": int(ts) * 1000 if ts else 0})
+        return out
+    except Exception:
+        return []
+
+
+# ----------------------------- 时段 -----------------------------
+def session_info(market, now=None):
+    """返回 (距开盘分钟, 距收盘分钟) ;非交易中返回 None。"""
+    d = datetime.fromtimestamp(now or time.time(), TZ[market])
+    if d.weekday() >= 5:
+        return None
+    t = d.hour * 60 + d.minute
+    if market == "US":
+        return (t - 570, 960 - t) if 570 <= t < 960 else None
+    if 570 <= t < 690:
+        return (t - 570, (690 - t) + 120)
+    if 780 <= t < 900:
+        return (t - 570 - 90, 900 - t)
+    return None
+
+
+def prev_weekday(d):
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def next_weekday(d):
+    d = d + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def f(v, d=2, sign=False):
+    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+        return "--"
+    return (("%+." + str(d) + "f") % v) if sign else (("%." + str(d) + "f") % v)
+
+
+def fmt_bj(ms):
+    return datetime.fromtimestamp(ms / 1000, CN_TZ).strftime("%m-%d %H:%M:%S")
+
+
+# ----------------------------- JSON 解析 -----------------------------
+def extract_json(s):
+    i = s.find("{")
+    while i != -1:
+        depth, instr, esc = 0, False, False
+        for j in range(i, len(s)):
+            ch = s[j]
+            if instr:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    instr = False
+            elif ch == '"':
+                instr = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(s[i:j + 1])
+                    except Exception:
+                        break
+        i = s.find("{", i + 1)
+    return None
+
+
+def split_think(full):
+    if "</think>" in full:
+        a, b = full.split("</think>", 1)
+        return a.replace("<think>", "").strip(), b.strip()
+    return full.replace("<think>", "").strip(), ""
+
+
+def clamp(v, lo, hi, default):
+    try:
+        v = float(v)
+        if math.isnan(v):
+            return default
+        return max(lo, min(hi, v))
+    except Exception:
+        return default
+
+
+# ----------------------------- GPU / LLM 状态 -----------------------------
+_gpu_cache = {"at": 0, "v": []}
+
+
+def gpu_stats():
+    if time.time() - _gpu_cache["at"] < 1.2:
+        return _gpu_cache["v"]
+    v = []
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3).stdout
+        for line in out.strip().splitlines():
+            p = [x.strip() for x in line.split(",")]
+            v.append({"i": int(p[0]), "name": p[1], "util": float(p[2]), "memUsed": float(p[3]), "memTotal": float(p[4])})
+    except Exception:
+        v = []
+    _gpu_cache.update(at=time.time(), v=v)
+    return v
+
+
+_llm_cache = {"at": 0, "up": False, "model": ""}
+
+
+def llm_health():
+    if time.time() - _llm_cache["at"] < 4:
+        return _llm_cache
+    up, model = False, ""
+    try:
+        j = http_json(LLM_URL + "/models", timeout=2, retries=0)
+        up, model = True, (j.get("data") or [{}])[0].get("id", "")
+    except Exception:
+        pass
+    _llm_cache.update(at=time.time(), up=up, model=model)
+    return _llm_cache
+
+
+def llm_stream(messages, max_tokens, thinking, on_text=None, timeout=900):
+    body = {"model": LLM_NAME, "messages": messages, "max_tokens": max_tokens, "temperature": 0.5, "top_p": 0.9,
+            "top_k": 20, "stream": True, "chat_template_kwargs": {"enable_thinking": bool(thinking)}}
+    req = urllib.request.Request(LLM_URL + "/chat/completions", data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    text, reasoning, finish, ntok = "", "", None, 0
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            d = line[5:].strip()
+            if d == "[DONE]":
+                break
+            j = json.loads(d)
+            ch = (j.get("choices") or [{}])[0]
+            delta = ch.get("delta") or {}
+            rc = delta.get("reasoning_content") or delta.get("reasoning") or ""
+            if rc:
+                reasoning += rc
+            piece = delta.get("content") or ""
+            text += piece
+            if piece or rc:
+                ntok += 1
+                if on_text and ntok % 4 == 0:
+                    on_text(("<think>" + reasoning + "</think>" if reasoning and not text else "") + text, ntok)
+            if ch.get("finish_reason"):
+                finish = ch["finish_reason"]
+    full = ("<think>" + reasoning + "</think>" if reasoning else "") + text
+    return full, finish, ntok
+
+
+SYSTEM_PROMPT = (
+    "你是一名严谨的量化基金经理兼金融数学研究员,正在为一个【模拟盘】做下一步操作决策。"
+    "标的:IBB、XBI(美股生物科技ETF)与159502(嘉实标普生物科技ETF,跟踪标普生物科技精选行业指数,与XBI高度同源)。\n"
+    "硬性规则:\n"
+    "1) 只能使用用户消息里给出的数据与数字;缺失就写缺失,严禁编造价格、新闻或统计量。\n"
+    "2) 只做多或空仓(BUY 开多 / SELL 平掉已有多仓 / HOLD 观望)。没有统计优势时必须 HOLD,宁可错过也不要凑交易。\n"
+    "3) 必须先检验:样本外是否有优势(IC、命中率及其置信下界)、预期收益是否显著大于往返成本、市场状态(方差比)是否支持该类策略、"
+    "宏观与大盘(VIX、美债、美元、SPY/QQQ/XLV)是否逆风、消息面是否有重大风险,再给结论。\n"
+    "4) 思考要精炼(尽量不超过 700 字),最后只输出一个 JSON 对象,不要输出其他文字。"
+)
+
+OUTPUT_SPEC = (
+    "【输出格式】仅输出 JSON:\n"
+    '{"action":"BUY|SELL|HOLD","strategy":"intraday|swing|none","confidence":0到1之间的小数,'
+    '"horizon_min":持有分钟数(整数,5~1440),"stop_pct":止损幅度(%,如0.6),"target_pct":止盈幅度(%,如1.2),'
+    '"thesis":"不超过80字的中文结论","factors":[{"factor":"因素","direction":"bull|bear|neutral","weight":0到1}],'
+    '"risks":["最多3条风险"]}\n'
+    "说明:intraday=日内(收盘前平仓,依据5分钟模型);swing=隔夜/多日(依据日线模型或159502的隔夜联动模型)。"
+    "confidence 是你认为该方向在 horizon 内、扣除成本后仍盈利的概率。"
+)
+
+
+class Engine:
+    def __init__(self, host):
+        self.h = host
+        self.data = Data()
+        self.symbols = host["symbols"]
+        self.lock = threading.RLock()
+        self.studies = {}
+        self.ctx = {"at": 0, "v": {}}
+        self.news = {}
+        self.decisions = {}
+        self.history = []
+        self.live = {}
+        self.plans = {}
+        self.pending = []
+        self.score = {"n": 0, "buy_hit": 0, "buy_n": 0, "sum_ret": 0.0, "sell_n": 0, "sell_hit": 0}
+        self.last_view = 0.0
+        self.force = set()
+        self.last_trade = {}
+        self.tps = 0.0
+        self.last_err = ""
+        self.wake = threading.Event()
+        self.save_path = os.path.join(os.environ.get("QUANT_SAVE_DIR", "/kaggle/working" if os.path.isdir("/kaggle/working") else "."), "ai_decisions.jsonl")
+
+    # ---------- 基础 ----------
+    def sym(self, code):
+        return next(s for s in self.symbols if s["code"] == code)
+
+    def cost_rt(self, code):
+        m = self.sym(code)["market"]
+        return 2.0 * (self.h["fee_rate"] + SLIP[m])
+
+    def start(self):
+        threading.Thread(target=self._bg_loop, daemon=True).start()
+        threading.Thread(target=self._analysis_loop, daemon=True).start()
+
+    # ---------- 后台:数据与统计检验 ----------
+    def _bg_loop(self):
+        while True:
+            try:
+                for s in self.symbols:
+                    self.refresh_study(s["code"])
+                if time.time() - self.ctx["at"] > 600:
+                    self.refresh_ctx()
+                for s in self.symbols:
+                    if s["market"] == "US" and time.time() - self.news.get(s["code"], {}).get("at", 0) > 900:
+                        self.news[s["code"]] = {"at": time.time(), "v": news_titles(s["code"])}
+            except Exception as ex:
+                self.last_err = "bg: %s" % ex
+                log("bg error", ex)
+            time.sleep(30)
+
+    def refresh_ctx(self):
+        v = {}
+        for name, (ysym, esym) in CTX.items():
+            time.sleep(0.4)
+            b = self.data.raw(ysym, "1d", "6mo", 300, esym)
+            if len(b) >= 25:
+                c = [x[4] for x in b]
+                last = c[-1]
+                z = None
+                w = c[-60:]
+                mu = sum(w) / len(w)
+                sd = math.sqrt(sum((x - mu) ** 2 for x in w) / len(w))
+                if sd > 0:
+                    z = (last - mu) / sd
+                v[name] = {"last": last, "r1": last / c[-2] - 1, "r5": last / c[-6] - 1, "r20": last / c[-21] - 1, "z60": z,
+                           "date": datetime.fromtimestamp(b[-1][0] / 1000, timezone.utc).strftime("%m-%d")}
+        self.ctx = {"at": time.time(), "v": v}
+
+    def refresh_study(self, code):
+        b5, b1d = self.data.bars(code, "5m"), self.data.bars(code, "1d")
+        key = (b5[-1][0] if b5 else 0, b1d[-1][0] if b1d else 0, len(b5), len(b1d))
+        st = self.studies.get(code)
+        if st and st["key"] == key and time.time() - st["at"] < 180:
+            return st
+        m = self.sym(code)["market"]
+        cost = self.cost_rt(code)
+        res = {"key": key, "at": time.time(), "intra": None, "daily": None, "gap": None, "regime": {}, "corr": None}
+        try:
+            res["intra"] = qm.edge_study(b5, "intra", 6, cost, "5分钟K线") if len(b5) else None
+            res["daily"] = qm.edge_study(b1d, "daily", 1, cost, "日K线") if len(b1d) else None
+            if len(b5) > 200:
+                c5 = [x[4] for x in b5[-1500:]]
+                vr = qm.variance_ratio(c5, 6)
+                res["regime"]["vr5m"] = vr
+                res["regime"]["label5m"] = qm.regime_label(vr)
+                res["regime"]["trend5m"] = qm.trend_tstat(c5, 60)
+                res["regime"]["atr5m_pct"] = qm.atr_last([x[2] for x in b5], [x[3] for x in b5], [x[4] for x in b5]) / b5[-1][4] * 100
+            if len(b1d) > 60:
+                res["regime"]["atr1d_pct"] = qm.atr_last([x[2] for x in b1d], [x[3] for x in b1d], [x[4] for x in b1d]) / b1d[-1][4] * 100
+                c = [x[4] for x in b1d]
+                res["regime"]["rng20"] = (c[-1] - min(c[-20:])) / max(1e-9, max(c[-20:]) - min(c[-20:]))
+                res["regime"]["vr1d"] = qm.variance_ratio(c, 5)
+            if code == "159502":
+                res["gap"] = self.gap_model(b1d)
+            if code in ("IBB", "XBI"):
+                other = "XBI" if code == "IBB" else "IBB"
+                a = [(x[0], x[4]) for x in self.data.bars(code, "5m")[-400:]]
+                o = [(x[0], x[4]) for x in self.data.bars(other, "5m")[-400:]]
+                cr, n = qm.corr_aligned(a, o)
+                res["corr"] = {"vs": other, "corr": cr, "n": n}
+        except Exception as ex:
+            res["err"] = str(ex)
+            log("study error", code, ex)
+        self.studies[code] = res
+        return res
+
+    def gap_model(self, cn_daily):
+        """隔夜联动:159502 当日收益 ~ α + β·(前一美股交易日 XBI 收益)。"""
+        xb = self.data.bars("XBI", "1d")
+        if len(xb) < 80 or len(cn_daily) < 80:
+            return None
+        us = {}
+        for i in range(1, len(xb)):
+            d = datetime.fromtimestamp(xb[i][0] / 1000, US_TZ).date()
+            us[d] = xb[i][4] / xb[i - 1][4] - 1
+        us_dates = sorted(us)
+        xs, ys = [], []
+        for i in range(1, len(cn_daily)):
+            D = datetime.fromtimestamp(cn_daily[i][0] / 1000, CN_TZ).date()
+            prior = [d for d in us_dates[-400:] if d < D]
+            if not prior:
+                continue
+            xs.append(us[prior[-1]])
+            ys.append(cn_daily[i][4] / cn_daily[i - 1][4] - 1)
+        r = qm.ols(xs[-250:], ys[-250:])
+        if not r:
+            return None
+        # 当前应参照的美股交易日
+        now = datetime.now(CN_TZ)
+        t = now.hour * 60 + now.minute
+        if now.weekday() < 5 and t < 900:
+            nxt = now.date()  # 今日 A 股会话(未开/进行中)
+        else:
+            nxt = next_weekday(now.date())  # 今日已收盘 / 周末 -> 下一 A 股会话
+        need = prev_weekday(nxt)
+        r_us = us.get(need)
+        out = {"alpha": r["alpha"], "beta": r["beta"], "t": r["t"], "r2": r["r2"], "n": r["n"], "resid_sd": r["resid_sd"],
+               "session": nxt.isoformat(), "us_ref_date": need.isoformat(), "us_ref_ret": r_us}
+        if r_us is None:
+            out["note"] = "参照美股交易日(%s)的 XBI 数据尚不可用,隔夜联动信号无效" % need
+            return out
+        exp_full = r["alpha"] + r["beta"] * r_us
+        realized = 0.0
+        q = self.h["quote"]("159502")
+        if nxt == now.date() and q and q["prevClose"] > 0 and self.h["market_state"]("159502") in ("open", "lunch"):
+            realized = q["price"] / q["prevClose"] - 1
+        out["expected_full"] = exp_full
+        out["realized_so_far"] = realized
+        out["expected_remaining"] = exp_full - realized
+        out["p_up"] = qm.norm_cdf((exp_full - realized) / max(r["resid_sd"], 1e-9))
+        return out
+
+    # ---------- 提示词 ----------
+    def study_text(self, s, name):
+        if not s or not s.get("ok"):
+            return "%s: 不可用(%s)" % (name, (s or {}).get("reason", "无数据"))
+        o, l = s["oos"], s["live"]
+        hit = "--" if o["hit"] is None else "%.1f%%(90%%下界%.1f%%)" % (o["hit"] * 100, o["hit_low90"] * 100)
+        lw = "--" if o["long_win"] is None else "%.0f%%" % (o["long_win"] * 100)
+        return ("%s[预测未来%d根]: 预测收益%sbp (σ=%sbp), 上涨概率%.1f%%; 样本外(%d个不重叠样本)IC=%s(t=%s), 方向命中%s, 基准上涨率%.1f%%, "
+                "做多信号扣费后净期望%sbp/笔(n=%d,胜率%s); 主要驱动:%s; 往返成本%.1fbp; 结论:%s"
+                % (name, s["H"], f(l["mu_h_bp"], 1, True), f(l["sigma_h_bp"], 1), l["p_up"] * 100, o["n"], f(o["ic"], 3, True), f(o["ic_t"], 2),
+                   hit, o["base_up"] * 100, f(o["long_net_bp"], 1, True), o["n_long"], lw,
+                   "、".join("%s%+.2f" % (a, b) for a, b in l["contrib"]), s["cost_rt_bp"],
+                   "样本外有方向性优势" + ("且显著" if s["significant"] else "但统计不显著") if s["reliable"] else "样本外无可靠优势"))
+
+    def snapshot(self, code):
+        s = self.sym(code)
+        q = self.h["quote"](code)
+        st = self.refresh_study(code)
+        now = time.time()
+        market = s["market"]
+        acc = self.h["account"]()
+        pos = acc["positions"].get(code)
+        ticks = self.h["ticks"](code, 1000)
+        L = []
+        L.append("【标的】%s %s | 币种 %s | 最小单位 %d | 市场状态: %s" % (code, s["name"], s["currency"], s["lot"], self.h["market_state"](code)))
+        L.append("北京时间 %s | 交易所本地时间 %s" % (fmt_bj(now * 1000), datetime.fromtimestamp(now, TZ[market]).strftime("%m-%d %H:%M")))
+        si = session_info(market)
+        L.append("交易时段: " + ("已开盘%d分钟, 距收盘%d分钟" % si if si else "非连续竞价时段"))
+        if q:
+            dec = s["decimals"]
+            L.append("【实时】现价 %s | 昨收 %s | 今开 %s | 最高 %s | 最低 %s | 日内涨跌 %s%% | 报价源 %s | 报价时间 %s"
+                     % (f(q["price"], dec), f(q["prevClose"], dec), f(q["open"], dec), f(q["high"], dec), f(q["low"], dec),
+                        f((q["price"] / q["prevClose"] - 1) * 100, 2, True), q["feed"], fmt_bj(q["quoteTime"])))
+        if len(ticks) > 60:
+            p = ticks[-1][1]
+
+            def back(sec):
+                for t, px in reversed(ticks):
+                    if t <= ticks[-1][0] - sec * 1000:
+                        return (p / px - 1) * 1e4
+                return None
+            L.append("【微观·1秒采样】近1分钟 %sbp | 近5分钟 %sbp | 近15分钟 %sbp(采样点%d)"
+                     % (f(back(60), 1, True), f(back(300), 1, True), f(back(900), 1, True), len(ticks)))
+        rg = st.get("regime", {})
+        vr = rg.get("vr5m")
+        L.append("【市场状态】5分钟序列:%s%s | 趋势回归 t=%s(近60根) | ATR(5m)=%s%% | 日线ATR=%s%% | 近20日区间位置=%s | 日线5日方差比 z=%s"
+                 % (rg.get("label5m", "--"), " (VR=%s,z=%s)" % (f(vr["vr"], 3), f(vr["z"], 2)) if vr else "",
+                    f((rg.get("trend5m") or {}).get("t"), 2, True), f(rg.get("atr5m_pct"), 3), f(rg.get("atr1d_pct"), 2),
+                    f(rg.get("rng20"), 2), f((rg.get("vr1d") or {}).get("z"), 2, True)))
+        L.append("【日内统计模型】" + self.study_text(st.get("intra"), "5分钟模型"))
+        L.append("【日线统计模型】" + self.study_text(st.get("daily"), "日线模型"))
+        g = st.get("gap")
+        if g:
+            if g.get("expected_remaining") is None:
+                L.append("【隔夜联动·XBI→159502】" + g.get("note", "不可用"))
+            else:
+                L.append("【隔夜联动·XBI→159502】回归(n=%d): 159502日收益=%s%%+%s×前一美股交易日XBI收益, β的t=%s, R²=%s; 参照美股日%s XBI收益 %s%% => 模型预期 %s 会话收益 %s%%, 已实现 %s%%, 剩余预期 %s%% (上涨概率 %.1f%%, 残差σ=%s%%)"
+                         % (g["n"], f(g["alpha"] * 100, 3, True), f(g["beta"], 3), f(g["t"], 2), f(g["r2"], 3), g["us_ref_date"],
+                            f(g["us_ref_ret"] * 100, 2, True), g["session"], f(g["expected_full"] * 100, 2, True),
+                            f(g["realized_so_far"] * 100, 2, True), f(g["expected_remaining"] * 100, 2, True), g["p_up"] * 100, f(g["resid_sd"] * 100, 2)))
+        cr = st.get("corr")
+        if cr and cr.get("corr") is not None:
+            L.append("【同类标的】与%s的5分钟收益相关系数 %s(n=%d)" % (cr["vs"], f(cr["corr"], 2), cr["n"]))
+        for o in self.symbols:
+            if o["code"] != code:
+                oq = self.h["quote"](o["code"])
+                if oq and oq["prevClose"] > 0:
+                    L.append("【同类行情】%s 现价 %s 日内 %s%% (%s)" % (o["code"], f(oq["price"], o["decimals"]), f((oq["price"] / oq["prevClose"] - 1) * 100, 2, True), self.h["market_state"](o["code"])))
+        cv = self.ctx["v"]
+        if cv:
+            L.append("【宏观与大盘·日线】" + "; ".join("%s %s(1日%s%%,5日%s%%,20日%s%%,60日z=%s)" % (
+                k, f(v["last"], 2), f(v["r1"] * 100, 2, True), f(v["r5"] * 100, 2, True), f(v["r20"] * 100, 2, True), f(v["z60"], 1, True)) for k, v in cv.items()))
+        nw = (self.news.get("XBI", {}).get("v") or []) + (self.news.get("IBB", {}).get("v") or [])
+        seen, titles = set(), []
+        for n in sorted(nw, key=lambda x: -x["ts"]):
+            if n["title"] not in seen:
+                seen.add(n["title"])
+                titles.append("[%s] %s" % (fmt_bj(n["ts"])[:11] if n["ts"] else "?", n["title"]))
+        L.append("【近期新闻标题(英文原文,来自 Yahoo Finance)】" + (" | ".join(titles[:6]) if titles else "无"))
+        eq = acc["equity"]
+        L.append("【账户】权益 ¥%s | 现金 ¥%s | 本标的持仓 %s | 今日AI已实现盈亏 ¥%s | 首次试用本金 ¥%s"
+                 % (f(eq, 2), f(acc["cash"], 2), ("%d(成本¥%s)" % (pos["qty"], f(pos["cost"], 2))) if pos and pos["qty"] > 0 else "无",
+                    f(acc.get("ai_pnl_24h", 0), 2, True), f(acc["initial"], 0)))
+        L.append("【交易成本】手续费单边%.2fbp + 保守滑点单边%.1fbp => 往返成本 %.1fbp。只有预期净优势显著大于成本才值得交易。"
+                 % (self.h["fee_rate"] * 1e4, SLIP[market] * 1e4, self.cost_rt(code) * 1e4))
+        L.append(OUTPUT_SPEC)
+        return "\n".join(L)
+
+    # ---------- 数学闸门 ----------
+    def gate(self, code, d, price):
+        """返回 (通过?, 检查列表, 仓位信息)。"""
+        checks = []
+
+        def chk(name, ok, detail):
+            checks.append({"name": name, "ok": bool(ok), "detail": detail})
+            return ok
+        s = self.sym(code)
+        st = self.studies.get(code) or {}
+        cost_bp = self.cost_rt(code) * 1e4
+        acc = self.h["account"]()
+        q = self.h["quote"](code)
+        si = session_info(s["market"])
+        strat = d.get("strategy", "none")
+        chk("AI 方向", d["action"] == "BUY", "AI 建议 %s(策略 %s)" % (d["action"], strat))
+        chk("AI 置信度≥0.60", d["confidence"] >= 0.60, "置信度 %.2f" % d["confidence"])
+        chk("行情为真实源", bool(q) and q["feed"] in ("sina", "tencent"), "报价源 %s" % (q["feed"] if q else "无"))
+        chk("处于连续竞价", si is not None, "非交易时段" if si is None else "已开盘%d分/距收盘%d分" % si)
+        if si is not None:
+            edge_min = 8 if strat == "swing" else 10
+            chk("避开开收盘 %d 分钟" % edge_min, si[0] >= edge_min and (si[1] >= edge_min or strat == "swing"), "开盘后%d分/距收盘%d分" % si)
+        # 选择与策略匹配的统计优势
+        cands = []
+        if strat == "intraday":
+            cands.append(("5分钟模型", st.get("intra")))
+        elif strat == "swing":
+            cands.append(("日线模型", st.get("daily")))
+        best = None
+        for name, sm in cands:
+            if sm and sm.get("ok") and sm.get("reliable"):
+                mu = sm["live"]["mu_h_bp"]
+                p = sm["live"]["p_up"]
+                if best is None or mu > best[1]:
+                    best = (name, mu, p, sm["live"]["sigma_h_bp"])
+        g = st.get("gap")
+        if strat == "swing" and g and g.get("expected_remaining") is not None and g.get("t", 0) >= 2.0:
+            mu = g["expected_remaining"] * 1e4
+            if best is None or mu > best[1]:
+                best = ("隔夜联动模型", mu, g["p_up"], g["resid_sd"] * 1e4)
+        if not chk("样本外统计优势", best is not None, ("采用 %s" % best[0]) if best else "策略对应的模型样本外无可靠优势(IC≤0 或 命中率<50%),或策略为 none"):
+            best = ("无", 0.0, 0.5, 0.0)
+        chk("预期净优势≥1.5×成本", best[1] >= 1.5 * cost_bp, "预期 %+.1fbp vs 往返成本 %.1fbp×1.5=%.1fbp" % (best[1], cost_bp, 1.5 * cost_bp))
+        chk("模型上涨概率≥52%", best[2] >= 0.52, "%.1f%%" % (best[2] * 100))
+        chk("今日AI亏损未超3%本金", acc.get("ai_pnl_24h", 0) > -0.03 * acc["initial"], "近24h AI 已实现 ¥%.2f" % acc.get("ai_pnl_24h", 0))
+        pos = acc["positions"].get(code)
+        chk("当前无持仓(不加仓)", not (pos and pos["qty"] > 0), "已持有" if pos and pos["qty"] > 0 else "空仓")
+        chk("冷却≥5分钟", time.time() - self.last_trade.get(code, 0) >= 300, "距上次AI成交 %d 秒" % min(99999, time.time() - self.last_trade.get(code, 0)))
+        stop = clamp(d.get("stop_pct"), 0.15, 4.0, 0.6) / 100.0
+        target = clamp(d.get("target_pct"), 0.0, 10.0, 1.0) / 100.0
+        chk("目标≥2×往返成本", target * 1e4 >= 2 * cost_bp, "目标 %.1fbp vs %.1fbp" % (target * 1e4, 2 * cost_bp))
+        p_eff = 0.5 + (best[2] - 0.5) * 0.7  # 向 0.5 收缩 30%,抵御估计误差
+        frac = qm.size_fraction(p_eff, target, stop) if all(c["ok"] for c in checks) else 0.0
+        chk("分数凯利仓位>0", frac > 0, "p_eff=%.3f, 目标/止损=%.2f, 仓位 %.1f%% 权益" % (p_eff, target / stop if stop else 0, frac * 100))
+        ok = all(c["ok"] for c in checks)
+        return ok, checks, {"stop": stop, "target": target, "frac": frac, "edge_bp": best[1], "p_model": best[2], "model": best[0]}
+
+    # ---------- 分析与执行 ----------
+    def trigger(self, code=None):
+        for s in self.symbols:
+            if code in (None, s["code"]):
+                self.force.add(s["code"])
+        self.wake.set()
+
+    def _due(self, code):
+        if code in self.force:
+            return True
+        last = self.decisions.get(code, {}).get("ts", 0) / 1000.0
+        open_ = self.h["market_state"](code) == "open"
+        return time.time() - last >= (AI_INTERVAL if open_ else AI_CLOSED_INTERVAL)
+
+    def _analysis_loop(self):
+        while True:
+            try:
+                want = self.h["auto_mode"]() == 2 or time.time() - self.last_view < 90 or self.force
+                if want and llm_health()["up"]:
+                    codes = [s["code"] for s in self.symbols if self._due(s["code"])]
+                    ths = [threading.Thread(target=self.analyze, args=(c,), daemon=True) for c in codes]
+                    for t in ths:
+                        t.start()
+                    for t in ths:
+                        t.join()
+            except Exception as ex:
+                self.last_err = "loop: %s" % ex
+                log("loop error", ex)
+            self.wake.wait(5)
+            self.wake.clear()
+
+    def analyze(self, code):
+        self.force.discard(code)
+        t0 = time.time()
+        lv = {"running": True, "startedAt": int(t0 * 1000), "tail": "", "tokens": 0}
+        self.live[code] = lv
+        rec = {"ts": int(t0 * 1000), "code": code, "action": "HOLD", "finalAction": "HOLD", "confidence": 0.0, "error": ""}
+        try:
+            prompt = self.snapshot(code)
+            msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+
+            def on_text(txt, n):
+                lv["tail"] = txt[-900:]
+                lv["tokens"] = n
+            full, finish, ntok = llm_stream(msgs, MAX_TOKENS, THINKING, on_text)
+            think, ans = split_think(full)
+            d = extract_json(ans) if ans else None
+            truncated = d is None
+            if d is None:  # 推理被截断或格式错误:关闭思考模式快速重答一次
+                full2, _, n2 = llm_stream(msgs + [{"role": "user", "content": "请直接输出最终 JSON(不要再思考)。"}], 700, False)
+                d = extract_json(split_think(full2)[1] or full2)
+                ntok += n2
+            if d is None:
+                raise ValueError("模型未返回有效 JSON")
+            action = str(d.get("action", "HOLD")).upper()
+            if action not in ("BUY", "SELL", "HOLD"):
+                action = "HOLD"
+            dec = {"action": action, "strategy": str(d.get("strategy", "none")).lower(),
+                   "confidence": clamp(d.get("confidence"), 0, 1, 0.0), "horizon_min": int(clamp(d.get("horizon_min"), 5, 1440, 30)),
+                   "stop_pct": clamp(d.get("stop_pct"), 0.15, 4, 0.6), "target_pct": clamp(d.get("target_pct"), 0, 10, 1.0)}
+            q = self.h["quote"](code)
+            price = q["price"] if q else 0
+            ok, checks, info = self.gate(code, dec, price)
+            acc = self.h["account"]()
+            pos = acc["positions"].get(code)
+            final, exec_note = "HOLD", ""
+            mode = self.h["auto_mode"]()
+            if action == "BUY" and ok:
+                final = "BUY"
+            elif action == "SELL" and pos and pos["qty"] > 0:
+                final = "SELL"
+            rec.update({
+                "action": action, "finalAction": final, "strategy": dec["strategy"], "confidence": dec["confidence"],
+                "horizonMin": dec["horizon_min"], "stopPct": dec["stop_pct"], "targetPct": dec["target_pct"],
+                "thesis": str(d.get("thesis", ""))[:200], "factors": (d.get("factors") or [])[:8], "risks": (d.get("risks") or [])[:4],
+                "gate": {"pass": ok, "checks": checks, "info": info}, "price": price, "think": think, "thinkChars": len(think),
+                "latencyS": round(time.time() - t0, 1), "tokens": ntok, "truncated": truncated, "mode": mode,
+            })
+            dt = max(time.time() - t0, 1e-6)
+            self.tps = ntok / dt
+            if final == "BUY" and mode == 2:
+                exec_note = self.execute_buy(code, dec, info, price)
+            elif final == "SELL" and mode == 2:
+                r = self.h["place"](code, "SELL", pos["qty"], "ai", "AI 平仓: " + rec["thesis"][:40])
+                exec_note = "已平仓" if r.get("ok") else "平仓失败:%s" % r.get("error")
+                if r.get("ok"):
+                    self.plans.pop(code, None)
+                    self.last_trade[code] = time.time()
+            elif final != "HOLD":
+                exec_note = "AI 模式未开启:仅给出建议,未下单"
+            rec["exec"] = exec_note
+            if action in ("BUY", "SELL") and price > 0:
+                self.pending.append({"ts": time.time(), "code": code, "action": action, "p0": price, "h": dec["horizon_min"] * 60,
+                                     "cost": self.cost_rt(code)})
+        except Exception as ex:
+            rec["error"] = str(ex)[:200]
+            self.last_err = "analyze %s: %s" % (code, ex)
+            log("analyze error", code, ex)
+        finally:
+            lv["running"] = False
+            with self.lock:
+                self.decisions[code] = rec
+                self.history.insert(0, {k: rec.get(k) for k in ("ts", "code", "action", "finalAction", "confidence", "thesis", "exec", "error", "price")})
+                del self.history[60:]
+            try:
+                with open(self.save_path, "a", encoding="utf-8") as fp:
+                    fp.write(json.dumps({k: v for k, v in rec.items() if k != "think"}, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
+    def execute_buy(self, code, dec, info, price):
+        s = self.sym(code)
+        acc = self.h["account"]()
+        fx = self.h["fx"](s)
+        unit = price * fx * (1 + self.h["fee_rate"]) * s["lot"]
+        budget = min(acc["equity"] * info["frac"], acc["cash"])
+        lots = int(budget // unit)
+        if lots < 1:
+            return "资金不足一手(预算 ¥%.2f < 单手 ¥%.2f)" % (budget, unit)
+        r = self.h["place"](code, "BUY", lots * s["lot"], "ai", "AI买入[%s] %s" % (dec["strategy"], info["model"]))
+        if not r.get("ok"):
+            return "下单失败:%s" % r.get("error")
+        swing = dec["strategy"] == "swing"
+        self.plans[code] = {"stop": price * (1 - info["stop"]), "target": price * (1 + info["target"]),
+                            "expire": time.time() + dec["horizon_min"] * 60, "swing": swing, "entry": time.time()}
+        self.last_trade[code] = time.time()
+        return "已买入 %d @ %s,止损 %s 止盈 %s" % (lots * s["lot"], f(price, s["decimals"]), f(self.plans[code]["stop"], s["decimals"]), f(self.plans[code]["target"], s["decimals"]))
+
+    def on_tick(self):
+        """每秒调用:AI 持仓的止损/止盈/到期/收盘前平仓 + 决策复盘评分。"""
+        now = time.time()
+        if self.h["auto_mode"]() == 2:
+            acc = self.h["account"]()
+            for code, pl in list(self.plans.items()):
+                pos = acc["positions"].get(code)
+                q = self.h["quote"](code)
+                if not pos or pos["qty"] <= 0:
+                    self.plans.pop(code, None)
+                    continue
+                if not q or q["feed"] not in ("sina", "tencent") or self.h["market_state"](code) != "open":
+                    continue
+                px, why = q["price"], ""
+                si = session_info(self.sym(code)["market"])
+                if px <= pl["stop"]:
+                    why = "AI止损"
+                elif px >= pl["target"]:
+                    why = "AI止盈"
+                elif now >= pl["expire"]:
+                    why = "AI到期平仓"
+                elif not pl["swing"] and si and si[1] <= 3:
+                    why = "AI收盘前平仓"
+                if why:
+                    r = self.h["place"](code, "SELL", pos["qty"], "ai", why)
+                    if r.get("ok"):
+                        self.plans.pop(code, None)
+                        self.last_trade[code] = now
+        keep = []
+        for p in self.pending:
+            if now - p["ts"] < p["h"]:
+                keep.append(p)
+                continue
+            q = self.h["quote"](p["code"])
+            if not q:
+                continue
+            ret = q["price"] / p["p0"] - 1
+            with self.lock:
+                self.score["n"] += 1
+                if p["action"] == "BUY":
+                    self.score["buy_n"] += 1
+                    self.score["sum_ret"] += ret - p["cost"]
+                    if ret - p["cost"] > 0:
+                        self.score["buy_hit"] += 1
+                else:
+                    self.score["sell_n"] += 1
+                    if ret < 0:
+                        self.score["sell_hit"] += 1
+        self.pending = keep
+
+    # ---------- 对外 ----------
+    def state(self, full=False, view=True):
+        if view:
+            self.last_view = time.time()
+        lh = llm_health()
+        with self.lock:
+            decs = {}
+            for c, d in self.decisions.items():
+                x = dict(d)
+                if not full:
+                    x["think"] = (x.get("think") or "")[-500:]
+                decs[c] = x
+            sc = dict(self.score)
+        sc["buy_rate"] = (sc["buy_hit"] / sc["buy_n"]) if sc["buy_n"] else None
+        sc["avg_net_bp"] = (sc["sum_ret"] / sc["buy_n"] * 1e4) if sc["buy_n"] else None
+        studies = {}
+        for c, st in self.studies.items():
+            def brief(s):
+                if not s or not s.get("ok"):
+                    return {"ok": False, "reason": (s or {}).get("reason", "无数据")}
+                return {"ok": True, "label": s["label"], "H": s["H"], "oos": s["oos"], "live": {k: v for k, v in s["live"].items() if k != "feat"},
+                        "reliable": s["reliable"], "significant": s["significant"], "cost_rt_bp": s["cost_rt_bp"]}
+            studies[c] = {"intra": brief(st.get("intra")), "daily": brief(st.get("daily")), "gap": st.get("gap"),
+                          "regime": st.get("regime"), "corr": st.get("corr"), "bars5": len(self.data.cache.get((c, "5m"), (0, []))[1]),
+                          "bars1d": len(self.data.cache.get((c, "1d"), (0, []))[1])}
+        return {"available": True, "llm": {"up": lh["up"], "model": lh["model"], "tps": round(self.tps, 1), "name": LLM_NAME},
+                "gpus": gpu_stats(), "mode": {0: "off", 1: "rule", 2: "ai"}[self.h["auto_mode"]()], "interval": AI_INTERVAL,
+                "decisions": decs, "live": self.live, "history": self.history[:30], "score": sc, "studies": studies,
+                "plans": {c: {k: v for k, v in p.items()} for c, p in self.plans.items()},
+                "ctx": self.ctx["v"], "err": self.last_err, "now": int(time.time() * 1000),
+                "data": {("%s:%s" % k): v for k, v in self.data.meta.items() if isinstance(k, tuple) and len(k) == 2}}
+
+    def history_bars(self, code, tf):
+        if code not in DATA_MAP or tf not in TF_SEC:
+            raise ValueError("bad code/tf")
+        b = self.data.bars(code, tf)
+        meta = self.data.meta.get((code, tf), {})
+        return {"code": code, "tf": tf, "bars": b, "src": meta.get("src"), "ok": meta.get("ok", False), "err": meta.get("err", "")}
+'''
+
+MATH_PY = r'''"""
+量化数学内核(numpy)——所有数字都由真实历史K线计算得出,不含任何编造数据。
+
+包含:
+  * 波动率:EWMA(RiskMetrics λ=0.94)、ATR(Wilder)
+  * 状态识别:Lo-MacKinlay 方差比检验(趋势/均值回归/随机游走)、线性趋势 t 统计量
+  * 特征工程:波动率标准化动量、Z-score、Wilder RSI、MACD 柱、区间位置、量比、VWAP 偏离
+  * 预测与验证:岭回归 + 70/30 时间切分(含 embargo)+ 不重叠样本外检验(IC、命中率、净期望、t 值、Wilson 区间)
+  * 风控:分数凯利 + 单笔风险预算 + 仓位上限
+结论原则:样本外没有统计优势 => 不交易。
+"""
+import math
+
+import numpy as np
+
+SQRT2 = math.sqrt(2.0)
+
+
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / SQRT2))
+
+
+def _f(x):
+    return np.asarray(x, dtype=float)
+
+
+# ----------------------------- 基础序列函数 -----------------------------
+def ema(x, n):
+    x = _f(x)
+    out = np.empty_like(x)
+    if len(x) == 0:
+        return out
+    a = 2.0 / (n + 1.0)
+    out[0] = x[0]
+    for i in range(1, len(x)):
+        out[i] = a * x[i] + (1.0 - a) * out[i - 1]
+    return out
+
+
+def rolling_mean(x, n):
+    x = _f(x)
+    out = np.full(len(x), np.nan)
+    if len(x) >= n:
+        c = np.cumsum(np.insert(x, 0, 0.0))
+        out[n - 1:] = (c[n:] - c[:-n]) / n
+    return out
+
+
+def rolling_std(x, n):
+    x = _f(x)
+    m = rolling_mean(x, n)
+    m2 = rolling_mean(x * x, n)
+    return np.sqrt(np.maximum(m2 - m * m, 0.0))
+
+
+def wilder_rsi(c, n=14):
+    c = _f(c)
+    out = np.full(len(c), 50.0)
+    if len(c) <= n:
+        return out
+    d = np.diff(c, prepend=c[0])
+    up, dn = np.maximum(d, 0.0), np.maximum(-d, 0.0)
+    au, ad = up[1:n + 1].mean(), dn[1:n + 1].mean()
+    for i in range(n, len(c)):
+        if i > n:
+            au = (au * (n - 1) + up[i]) / n
+            ad = (ad * (n - 1) + dn[i]) / n
+        if ad == 0:
+            out[i] = 50.0 if au == 0 else 100.0
+        else:
+            out[i] = 100.0 - 100.0 / (1.0 + au / ad)
+    return out
+
+
+def atr_last(h, l, c, n=14):
+    h, l, c = _f(h), _f(l), _f(c)
+    if len(c) < n + 2:
+        return float("nan")
+    pc = np.r_[c[0], c[:-1]]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    a = tr[1:n + 1].mean()
+    for i in range(n + 1, len(tr)):
+        a = (a * (n - 1) + tr[i]) / n
+    return float(a)
+
+
+def ewma_vol_series(r, lam=0.94, floor=1e-5):
+    """每根K线收盘时已知的 EWMA 波动率(不含未来信息)。"""
+    r = _f(r)
+    n = len(r)
+    out = np.empty(n)
+    v = float(np.var(r[: min(n, 50)])) if n else 0.0
+    v = max(v, floor * floor)
+    for i in range(n):
+        v = lam * v + (1.0 - lam) * r[i] * r[i]
+        out[i] = math.sqrt(max(v, floor * floor))
+    return out
+
+
+# ----------------------------- 状态识别 -----------------------------
+def variance_ratio(c, q):
+    """Lo-MacKinlay 方差比与 z 值(同方差近似)。VR>1 趋势/动量;VR<1 均值回归。"""
+    lc = np.log(_f(c))
+    r = np.diff(lc)
+    T = len(r)
+    if T < q * 10:
+        return None
+    mu = r.mean()
+    s1 = ((r - mu) ** 2).sum() / (T - 1)
+    if s1 <= 0:
+        return None
+    rq = lc[q:] - lc[:-q]
+    m = q * (T - q + 1) * (1.0 - q / T)
+    sq = ((rq - q * mu) ** 2).sum() / m
+    vr = sq / s1
+    z = (vr - 1.0) / math.sqrt(2.0 * (2 * q - 1) * (q - 1) / (3.0 * q * T))
+    return {"q": q, "vr": float(vr), "z": float(z)}
+
+
+def trend_tstat(c, n=60):
+    """对数价格对时间的线性回归:每根K线斜率(%)、t 统计量、R²。"""
+    c = _f(c)[-n:]
+    if len(c) < 20:
+        return None
+    y = np.log(c)
+    x = np.arange(len(y), dtype=float)
+    r = ols(x, y)
+    if not r:
+        return None
+    return {"slope_pct": r["beta"] * 100.0, "t": r["t"], "r2": r["r2"], "n": r["n"]}
+
+
+def regime_label(vr):
+    if not vr:
+        return "样本不足"
+    if vr["z"] > 1.96:
+        return "趋势/动量(方差比显著>1)"
+    if vr["z"] < -1.96:
+        return "均值回归(方差比显著<1)"
+    return "近似随机游走(无显著趋势或回归)"
+
+
+def ols(x, y):
+    x, y = _f(x), _f(y)
+    n = len(x)
+    if n < 20:
+        return None
+    xm, ym = x.mean(), y.mean()
+    sxx = ((x - xm) ** 2).sum()
+    if sxx <= 0:
+        return None
+    b = ((x - xm) * (y - ym)).sum() / sxx
+    a = ym - b * xm
+    res = y - a - b * x
+    sse = (res ** 2).sum()
+    s2 = sse / (n - 2)
+    se = math.sqrt(s2 / sxx) if s2 > 0 else 0.0
+    sst = ((y - ym) ** 2).sum()
+    return {"alpha": float(a), "beta": float(b), "t": float(b / se) if se > 0 else 0.0,
+            "r2": float(1 - sse / sst) if sst > 0 else 0.0, "n": int(n), "resid_sd": float(math.sqrt(s2))}
+
+
+# ----------------------------- 特征工程 -----------------------------
+def feature_matrix(bars, kind):
+    """bars: [[t_ms,o,h,l,c,v],...]; kind: 'intra'(5分钟) | 'daily'。"""
+    B = _f(bars)
+    n = len(B)
+    t, h, l, c, v = B[:, 0], B[:, 2], B[:, 3], B[:, 4], B[:, 5]
+    lc = np.log(c)
+    r1 = np.diff(lc, prepend=lc[0])
+    sig = ewma_vol_series(r1)
+    ks = (1, 6, 24) if kind == "intra" else (1, 5, 20)
+    cols, names = [], []
+    for k in ks:
+        m = np.zeros(n)
+        m[k:] = lc[k:] - lc[:-k]
+        cols.append(np.clip(m / (sig * math.sqrt(k)), -6, 6))
+        names.append("动量%d" % k)
+    sma, sd = rolling_mean(c, 20), rolling_std(c, 20)
+    z = np.nan_to_num(np.where(sd > 0, (c - sma) / np.where(sd > 0, sd, 1.0), 0.0))
+    cols.append(np.clip(z, -4, 4)); names.append("Z20")
+    cols.append((wilder_rsi(c, 14) - 50.0) / 25.0); names.append("RSI14")
+    macd = ema(c, 12) - ema(c, 26)
+    hist = (macd - ema(macd, 9)) / (c * sig)
+    cols.append(np.clip(hist, -6, 6)); names.append("MACD柱")
+    rng = h - l
+    cols.append(np.where(rng > 0, (c - l) / np.where(rng > 0, rng, 1.0) - 0.5, 0.0)); names.append("区间位置")
+    vm = rolling_mean(v, 20)
+    vr = np.nan_to_num(np.where(vm > 0, np.log((v + 1.0) / (vm + 1.0)), 0.0))
+    cols.append(np.clip(vr, -2, 2)); names.append("量比")
+    if kind == "intra":
+        day = np.cumsum(np.r_[0, (np.diff(t) > 4 * 3600 * 1000).astype(int)])
+        tp = (h + l + c) / 3.0 * v
+        vw = c.copy()
+        for d in np.unique(day):
+            m = day == d
+            cv, cp = np.cumsum(v[m]), np.cumsum(tp[m])
+            vw[m] = np.where(cv > 0, cp / np.where(cv > 0, cv, 1.0), c[m])
+        dev = np.nan_to_num((c - vw) / (c * sig))
+        cols.append(np.clip(dev, -6, 6)); names.append("VWAP偏离")
+    return np.column_stack(cols), names, c, sig, t
+
+
+def ridge(Z, y, lam):
+    ym = y.mean()
+    k = Z.shape[1]
+    w = np.linalg.solve(Z.T @ Z + lam * np.eye(k), Z.T @ (y - ym))
+    return w, ym
+
+
+def _rank(a):
+    return np.argsort(np.argsort(a)).astype(float)
+
+
+def _corr(a, b):
+    if len(a) < 5 or np.std(a) == 0 or np.std(b) == 0:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def wilson_low(k, n, z=1.645):
+    if n == 0:
+        return 0.0
+    p = k / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    s = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (c - s) / d
+
+
+def edge_study(bars, kind, H, cost_rt, label):
+    """
+    在真实历史上做"预测 H 根K线后收益"的岭回归,并用严格的时间外样本检验可靠性。
+    cost_rt: 往返成本(小数,如 0.0008)。
+    """
+    out = {"label": label, "H": H, "n_bars": len(bars), "ok": False}
+    need = 500 if kind == "intra" else 150
+    if len(bars) < need:
+        out["reason"] = "历史样本不足(%d<%d)" % (len(bars), need)
+        return out
+    X, names, c, sig, t = feature_matrix(bars, kind)
+    n = len(c)
+    lc = np.log(c)
+    warm = 60 if kind == "intra" else 30
+    idx = np.arange(warm, n - H)
+    fwd = lc[idx + H] - lc[idx]
+    y = np.clip(fwd / (sig[idx] * math.sqrt(H)), -6, 6)
+    Xi = X[idx]
+    split = int(len(idx) * 0.7)
+    tr = np.arange(0, split - H)  # embargo:训练集末尾去掉 H 根,避免与检验集标签重叠
+    te = np.arange(split, len(idx))
+    if len(tr) < 150 or len(te) < 60:
+        out["reason"] = "可用样本过少"
+        return out
+    mu, sd = Xi[tr].mean(0), Xi[tr].std(0) + 1e-9
+    Z = (Xi - mu) / sd
+    w, b = ridge(Z[tr], y[tr], 0.1 * len(tr))
+    pred = Z[te] @ w + b
+    sel = np.arange(0, len(te), H)  # 不重叠抽样,t 值不被重叠样本虚高
+    ps, ys, fs = pred[sel], y[sel], fwd[te][sel]
+    nz = ys != 0
+    ic = _corr(ps, ys)
+    ric = _corr(_rank(ps), _rank(ys))
+    ns = len(ps)
+    ic_t = ic * math.sqrt(max(ns - 2, 1)) / math.sqrt(max(1 - ic * ic, 1e-9))
+    hit_n = int(nz.sum())
+    hit_k = int((np.sign(ps[nz]) == np.sign(ys[nz])).sum()) if hit_n else 0
+    thr = 0.5 * float(np.std(Z[tr] @ w))
+    lm = ps > thr
+    nets = fs[lm] - cost_rt
+    n_long = int(lm.sum())
+    long_mean = float(nets.mean()) if n_long else 0.0
+    long_t = float(nets.mean() / (nets.std(ddof=1) / math.sqrt(n_long))) if n_long > 2 and nets.std(ddof=1) > 0 else 0.0
+    win_k = int((nets > 0).sum()) if n_long else 0
+    # 全样本重训练用于当前预测
+    mu2, sd2 = Xi.mean(0), Xi.std(0) + 1e-9
+    Za = (Xi - mu2) / sd2
+    wa, ba = ridge(Za, y, 0.1 * len(y))
+    fit = Za @ wa + ba
+    sres = float(np.std(y - fit)) or 1.0
+    zl = (X[-1] - mu2) / sd2
+    contrib = zl * wa
+    py = float(np.clip(zl @ wa + ba, -1.5, 1.5))
+    sig_last = float(sig[-1])
+    mu_h = py * sig_last * math.sqrt(H)
+    out.update({
+        "ok": True,
+        "oos": {"n": int(ns), "ic": ic, "rank_ic": ric, "ic_t": float(ic_t),
+                "hit": (hit_k / hit_n) if hit_n else None, "hit_n": hit_n,
+                "hit_low90": wilson_low(hit_k, hit_n) if hit_n else None,
+                "base_up": float((fs > 0).mean()),
+                "n_long": n_long, "long_net_bp": long_mean * 1e4, "long_t": long_t,
+                "long_win": (win_k / n_long) if n_long else None,
+                "train_n": int(len(tr)), "test_from_ms": int(t[idx[te[0]]])},
+        "live": {"pred_z": py, "mu_h_bp": mu_h * 1e4, "sigma_h_bp": sig_last * math.sqrt(H) * 1e4,
+                 "sigma_bar_bp": sig_last * 1e4, "p_up": norm_cdf(py / sres),
+                 "contrib": sorted([(names[i], float(contrib[i])) for i in range(len(names))], key=lambda z_: -abs(z_[1]))[:4],
+                 "feat": {names[i]: float(X[-1][i]) for i in range(len(names))}},
+        "reliable": bool(ic > 0 and hit_n > 0 and hit_k / hit_n >= 0.5),
+        "significant": bool(ic_t >= 1.65),
+        "cost_rt_bp": cost_rt * 1e4,
+    })
+    return out
+
+
+# ----------------------------- 风控 -----------------------------
+def kelly_fraction(p, b):
+    """b = 盈亏比(目标/止损)。f* = p - (1-p)/b。"""
+    if b <= 0:
+        return 0.0
+    return max(0.0, p - (1.0 - p) / b)
+
+
+def size_fraction(p_win, target_pct, stop_pct, risk_budget=0.01, kelly_mult=0.25, cap=0.4):
+    """仓位占权益比例 = min(上限, 1/4 凯利, 单笔风险预算/止损幅度)。"""
+    if stop_pct <= 0 or target_pct <= 0:
+        return 0.0
+    k = kelly_fraction(p_win, target_pct / stop_pct) * kelly_mult
+    r = risk_budget / stop_pct
+    return float(max(0.0, min(cap, k, r)))
+
+
+def corr_aligned(a, b):
+    """两个 [(t,c)] 序列按时间戳对齐后的收益相关系数。"""
+    da = {t: c for t, c in a}
+    xs, ys = [], []
+    prev = None
+    for t, c in b:
+        if t in da:
+            if prev is not None:
+                xs.append(math.log(da[t] / prev[0]))
+                ys.append(math.log(c / prev[1]))
+            prev = (da[t], c)
+    if len(xs) < 30:
+        return None, len(xs)
+    return _corr(np.array(xs), np.array(ys)), len(xs)
+'''
+
+INDEX_HTML = r'''<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>生物科技ETF 量化终端 · BIOTECH QUANT</title>
+<style>
+:root{--bg:#000;--panel:#05080c;--panel2:#080c12;--line:#121b28;--txt:#d9e2ef;--dim:#6a7a91;--acc:#3ab4ff;--gold:#f5b942;--vio:#c77dff;--up:#ff3b4e;--dn:#19c37d;--warn:#f5b942}
+body[data-cc="us"]{--up:#19c37d;--dn:#ff3b4e}
+*{box-sizing:border-box}
+html{font-size:min(1vw,1.7778vh);background:#000}
+body{margin:0;width:100vw;height:100vh;overflow:hidden;background:#000;color:var(--txt);font-family:-apple-system,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,sans-serif;font-size:1rem;line-height:1.25;user-select:none}
+.mono,.num{font-family:"SF Mono",Menlo,Consolas,"Roboto Mono",monospace;font-variant-numeric:tabular-nums}
+#app{display:grid;grid-template-rows:3.2rem minmax(0,1fr) 11rem;gap:.5rem;padding:.5rem;height:100vh;width:100vw}
+.panel{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:.55rem;position:relative;min-height:0;min-width:0;overflow:hidden}
+.ttl{font-size:.72rem;letter-spacing:.14em;color:var(--dim);text-transform:uppercase}
+.up{color:var(--up)}.dn{color:var(--dn)}.dim{color:var(--dim)}.gold{color:var(--gold)}.acc{color:var(--acc)}
+/* header */
+#hdr{display:flex;align-items:center;gap:1rem;padding:0 1rem}
+#hdr .logo{display:flex;align-items:baseline;gap:.6rem;white-space:nowrap}
+#hdr .logo b{font-size:1.35rem;letter-spacing:.06em;background:linear-gradient(90deg,#fff,var(--acc));-webkit-background-clip:text;background-clip:text;color:transparent}
+#hdr .logo span{font-size:.72rem;color:var(--dim);letter-spacing:.2em}
+.chips{display:flex;gap:.5rem;align-items:center;margin-left:.5rem}
+.chip{display:inline-flex;align-items:center;gap:.35rem;padding:.18rem .55rem;border:1px solid var(--line);border-radius:99rem;font-size:.78rem;color:var(--dim);white-space:nowrap}
+.chip i{width:.45rem;height:.45rem;border-radius:50%;background:var(--dim);display:inline-block}
+.chip.open{color:var(--txt);border-color:#1d3a2c}.chip.open i{background:var(--dn);box-shadow:0 0 .5rem var(--dn)}
+.chip.pre,.chip.post,.chip.lunch{color:var(--warn)}.chip.pre i,.chip.post i,.chip.lunch i{background:var(--warn)}
+.sp{flex:1}
+#feed{font-size:.8rem;display:flex;align-items:center;gap:.4rem;white-space:nowrap}
+#feed i{width:.55rem;height:.55rem;border-radius:50%;display:inline-block}
+#clock{font-size:1.25rem;letter-spacing:.05em;color:#fff}
+.btn{background:#0b121b;color:var(--txt);border:1px solid #1b2738;border-radius:.4rem;padding:.3rem .7rem;font-size:.8rem;cursor:pointer;font-family:inherit;white-space:nowrap}
+.btn:hover{border-color:var(--acc);color:#fff}
+.btn.on{background:#0d2a40;border-color:var(--acc);color:#fff}
+.btn.danger.arm{background:#3a0d14;border-color:var(--up);color:#fff}
+/* main grid */
+#main{display:grid;grid-template-columns:15rem minmax(0,1fr) 20.5rem;gap:.5rem;min-height:0}
+#left{display:grid;grid-template-rows:repeat(3,minmax(0,1fr));gap:.5rem;min-height:0}
+.card{padding:.7rem .8rem;cursor:pointer;display:flex;flex-direction:column;gap:.15rem;transition:border-color .15s}
+.card.sel{border-color:var(--acc);box-shadow:inset 0 0 0 1px rgba(58,180,255,.35),0 0 1.6rem rgba(58,180,255,.12)}
+.card .r1{display:flex;justify-content:space-between;align-items:center}
+.card .code{font-size:1.15rem;font-weight:700;letter-spacing:.04em}
+.card .nm{font-size:.7rem;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .px{font-size:2.05rem;font-weight:700;line-height:1.1;margin-top:.1rem}
+.card .chg{font-size:.95rem}
+.card .mini{display:grid;grid-template-columns:1fr 1fr;gap:0 .6rem;font-size:.7rem;color:var(--dim)}
+.card canvas{width:100%;flex:1;min-height:0;display:block}
+.card .pos{font-size:.72rem;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.flash-up{animation:fu .5s}.flash-dn{animation:fd .5s}
+@keyframes fu{from{background:rgba(255,59,78,.0);text-shadow:0 0 .8rem var(--up)}to{text-shadow:none}}
+@keyframes fd{from{text-shadow:0 0 .8rem var(--dn)}to{text-shadow:none}}
+/* center */
+#center{display:flex;flex-direction:column;min-height:0}
+#chead{display:flex;align-items:center;gap:.8rem;padding:.55rem .9rem .2rem}
+#chead .big{font-size:1.5rem;font-weight:700}
+#chead .px{font-size:1.5rem;font-weight:700}
+#chead .grp{display:flex;gap:.3rem}
+#chartwrap{flex:1;min-height:0;position:relative}
+#chart{position:absolute;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+#chart.drag{cursor:grabbing}
+#cfoot{display:grid;grid-template-columns:repeat(6,auto) 1fr;gap:.2rem 1.2rem;align-items:center;padding:.4rem .9rem .55rem;border-top:1px solid var(--line);font-size:.82rem;white-space:nowrap}
+#cfoot .k{color:var(--dim);font-size:.7rem;display:block}
+.sig{display:inline-block;padding:.15rem .6rem;border-radius:.35rem;font-weight:700;font-size:.85rem}
+.sig.BUY{background:rgba(255,59,78,.16);color:var(--up);border:1px solid var(--up)}
+body[data-cc="us"] .sig.BUY{background:rgba(25,195,125,.16)}
+.sig.SELL{background:rgba(25,195,125,.16);color:var(--dn);border:1px solid var(--dn)}
+body[data-cc="us"] .sig.SELL{background:rgba(255,59,78,.16)}
+.sig.HOLD{background:#0d1520;color:var(--dim);border:1px solid var(--line)}
+/* right */
+#right{display:grid;grid-template-rows:auto auto minmax(0,1fr);gap:.5rem;min-height:0}
+#acct{padding:.7rem .9rem}
+#acct .eq{font-size:2rem;font-weight:700;line-height:1.1}
+#acct .grid{display:grid;grid-template-columns:1fr 1fr;gap:.25rem .8rem;margin-top:.45rem;font-size:.8rem}
+#acct .grid div{display:flex;justify-content:space-between}
+#trade{padding:.7rem .9rem;display:flex;flex-direction:column;gap:.4rem}
+#trade .row{display:flex;gap:.4rem;align-items:center}
+#trade input{flex:1;min-width:0;background:#02050a;border:1px solid #1b2738;color:#fff;border-radius:.4rem;padding:.35rem .5rem;font-size:1.1rem;text-align:center;font-family:inherit;outline:none;user-select:text}
+#trade input:focus{border-color:var(--acc)}
+.sq{width:2rem;padding:.3rem 0;text-align:center}
+.qk{font-size:.7rem;padding:.12rem .45rem}
+.bs{flex:1;padding:.6rem 0;font-size:1.05rem;font-weight:700;border:0;border-radius:.45rem;color:#fff;cursor:pointer;font-family:inherit}
+.bs.buy{background:var(--up)}.bs.sell{background:var(--dn)}
+.bs:disabled{opacity:.4;cursor:wait}
+.bs:hover{filter:brightness(1.15)}
+#msg{font-size:.76rem;min-height:1rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#auto{padding:.6rem .9rem;display:flex;flex-direction:column;gap:.3rem;font-size:.76rem}
+#auto .reasons{color:var(--dim);overflow:hidden;line-height:1.35}
+.bar{height:.35rem;background:#0d1520;border-radius:9rem;overflow:hidden}
+.bar>div{height:100%;background:var(--acc);width:0}
+/* footer */
+#foot{display:grid;grid-template-columns:minmax(0,1fr) 22rem;gap:.5rem;min-height:0}
+#log{display:flex;flex-direction:column;padding:.5rem .8rem}
+#log .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:.3rem}
+table{border-collapse:collapse;width:100%;font-size:.8rem}
+th{color:var(--dim);font-weight:400;text-align:right;padding:.12rem .4rem;font-size:.7rem;border-bottom:1px solid var(--line);white-space:nowrap}
+td{text-align:right;padding:0 .4rem;height:1.55rem;white-space:nowrap;border-bottom:1px solid #0b121b}
+th:nth-child(1),td:nth-child(1),th:nth-child(2),td:nth-child(2){text-align:left}
+td.note{text-align:left;color:var(--dim);max-width:9rem;overflow:hidden;text-overflow:ellipsis}
+.tag{padding:.05rem .4rem;border-radius:.25rem;font-size:.72rem;font-weight:700}
+.tag.BUY{background:rgba(255,59,78,.16);color:var(--up)}.tag.SELL{background:rgba(25,195,125,.16);color:var(--dn)}
+body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .tag.SELL{background:rgba(255,59,78,.16)}
+#logbody{flex:1;min-height:0;overflow:hidden}
+.empty{color:var(--dim);text-align:center;padding-top:2.5rem;font-size:.9rem}
+#stats{display:grid;grid-template-columns:8.2rem 1fr;gap:.8rem;align-items:center;padding:.7rem .9rem}
+#ring{width:8rem;height:8rem;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--dim) 0 100%)}
+#ring>div{width:6.2rem;height:6.2rem;border-radius:50%;background:#05080c;display:flex;flex-direction:column;align-items:center;justify-content:center}
+#ring b{font-size:1.7rem;line-height:1}
+#ring span{font-size:.68rem;color:var(--dim);margin-top:.2rem}
+#stats .kv{display:grid;grid-template-columns:1fr auto;gap:.2rem .5rem;font-size:.82rem}
+#stats .kv span:nth-child(odd){color:var(--dim)}
+#stats .kv span:nth-child(even){text-align:right}
+/* AI 面板 */
+#auto{padding:.55rem .75rem;display:flex;flex-direction:column;gap:.3rem;font-size:.74rem;min-height:0;overflow:hidden}
+.aihd{display:flex;align-items:center;gap:.4rem}
+.aihd .grp{display:flex;gap:.2rem}.aihd .btn{padding:.18rem .5rem;font-size:.72rem}
+.gpus{display:flex;flex-direction:column;gap:.18rem}
+.gpu{display:grid;grid-template-columns:2.6rem 1fr 2.4rem 3.2rem;gap:.35rem;align-items:center;font-size:.68rem}
+.gb{height:.4rem;background:#0d1520;border-radius:9rem;overflow:hidden}.gb>div{height:100%;background:linear-gradient(90deg,#19c37d,#3ab4ff);transition:width .4s}
+#ai_body{flex:1;min-height:0;overflow:hidden;display:flex;flex-direction:column;gap:.22rem}
+.aift{display:flex;gap:.4rem}.aift .btn{flex:1;padding:.22rem 0;font-size:.74rem}
+.think .tt{color:#8fa3bd;font-size:.68rem;line-height:1.35;max-height:4.6rem;overflow:hidden;margin-top:.15rem;word-break:break-all}
+.thesis{color:#e7eefb;line-height:1.35}
+.gate{font-size:.7rem;padding:.12rem .4rem;border-radius:.3rem}.gate.pass{background:rgba(25,195,125,.14);color:#19c37d}.gate.fail{background:rgba(245,185,66,.12);color:var(--warn)}
+.stl{color:var(--dim);font-size:.68rem;line-height:1.3}.warn{color:var(--warn)}.dn2{color:#19c37d}
+#aimodal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:10}
+#aimodal.on{display:flex}
+#aimbox{width:70vw;height:86vh;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:.6rem;background:#04070b;border:1px solid #1b2738;border-radius:.7rem}
+#aim_body{flex:1;min-height:0;overflow:auto;user-select:text;font-size:.85rem;line-height:1.5}
+#aim_body h3{margin:.8rem 0 .2rem;font-size:1rem}#aim_body pre{white-space:pre-wrap;color:#9fb2cc;font-size:.78rem}
+.gt td{padding:.05rem .5rem;height:auto;text-align:left;border:0;font-size:.78rem}
+/* modal */
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;z-index:9}
+#modal.on{display:flex}
+#mbox{width:88vw;height:84vh;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:.6rem;background:#04070b;border:1px solid #1b2738;border-radius:.7rem}
+#mbox .bar2{display:flex;gap:.6rem;align-items:center}
+#mtable{flex:1;min-height:0;overflow:hidden}
+</style>
+</head>
+<body data-cc="cn">
+<div id="app">
+  <header id="hdr" class="panel">
+    <div class="logo"><b>生物科技ETF 量化终端</b><span>BIOTECH QUANT</span></div>
+    <div class="chips" id="mkts"></div>
+    <div class="sp"></div>
+    <div id="feed"><i style="background:#555"></i><span>连接中…</span></div>
+    <div class="chip mono" id="fx">USD/CNY --</div>
+    <button class="btn" id="cc" title="切换红涨绿跌 / 绿涨红跌">红涨绿跌</button>
+    <button class="btn danger" id="reset">重置账户</button>
+    <div id="clock" class="mono">--:--:--</div>
+  </header>
+
+  <div id="main">
+    <aside id="left"></aside>
+
+    <section id="center" class="panel">
+      <div id="chead">
+        <div class="big" id="ctitle">IBB</div>
+        <div class="px mono" id="cpx">--</div>
+        <div class="mono" id="cchg">--</div>
+        <div class="bar" style="width:5rem" title="规则指标预热进度(1秒采样需 120 秒)"><div id="warm"></div></div>
+        <div class="sp"></div>
+        <div class="grp" id="gmode">
+          <button class="btn on" data-mode="single">单标的</button>
+          <button class="btn" data-mode="compare">三只对比 %</button>
+        </div>
+        <div class="grp" id="gres">
+          <button class="btn on" data-res="tick">秒</button>
+          <button class="btn" data-res="1m">1分</button>
+          <button class="btn" data-res="5m">5分</button>
+          <button class="btn" data-res="15m">15分</button>
+          <button class="btn" data-res="1d">日</button>
+          <button class="btn" id="gnow" title="回到最新">⇥最新</button>
+        </div>
+        <div class="grp">
+          <button class="btn on" id="tma">均线</button>
+          <button class="btn on" id="tbo">布林</button>
+        </div>
+      </div>
+      <div id="chartwrap"><canvas id="chart"></canvas></div>
+      <div id="cfoot">
+        <div><span class="k">MA30</span><b class="mono gold" id="i_ma30">--</b></div>
+        <div><span class="k">MA120</span><b class="mono" id="i_ma120" style="color:var(--vio)">--</b></div>
+        <div><span class="k">RSI(60)</span><b class="mono" id="i_rsi">--</b></div>
+        <div><span class="k">布林上/下轨</span><b class="mono dim" id="i_boll">--</b></div>
+        <div><span class="k">综合评分</span><b class="mono" id="i_score">--</b></div>
+        <div><span class="k">策略信号</span><span class="sig HOLD" id="i_sig">预热中</span></div>
+        <div class="dim" id="i_reason" style="overflow:hidden;text-overflow:ellipsis;text-align:right"></div>
+      </div>
+    </section>
+
+    <aside id="right">
+      <div id="acct" class="panel">
+        <div class="ttl">模拟账户 · 人民币</div>
+        <div class="eq mono" id="a_eq">¥10,000.00</div>
+        <div class="mono" id="a_ret" style="font-size:.9rem">--</div>
+        <div class="grid">
+          <div><span class="dim">可用现金</span><span class="mono" id="a_cash">--</span></div>
+          <div><span class="dim">持仓市值</span><span class="mono" id="a_mv">--</span></div>
+          <div><span class="dim">已实现</span><span class="mono" id="a_real">--</span></div>
+          <div><span class="dim">浮动盈亏</span><span class="mono" id="a_unreal">--</span></div>
+        </div>
+      </div>
+      <div id="trade" class="panel">
+        <div class="row" style="justify-content:space-between"><span class="ttl">模拟下单</span><b id="t_sym">IBB</b><span class="dim mono" id="t_lot" style="font-size:.72rem"></span></div>
+        <div class="row">
+          <button class="btn sq" id="qm">−</button>
+          <input id="qty" type="number" min="1" step="1" value="1" inputmode="numeric">
+          <button class="btn sq" id="qp">+</button>
+        </div>
+        <div class="row" style="flex-wrap:wrap;gap:.25rem">
+          <span class="dim" style="font-size:.7rem;width:3.1rem">买入量</span>
+          <button class="btn qk" data-b="0.25">资金25%</button><button class="btn qk" data-b="0.5">50%</button><button class="btn qk" data-b="1">全仓</button>
+          <span class="dim" style="font-size:.7rem;width:3.1rem">卖出量</span>
+          <button class="btn qk" data-s="0.5">持仓50%</button><button class="btn qk" data-s="1">全部</button>
+        </div>
+        <div class="row dim mono" style="font-size:.74rem;justify-content:space-between"><span id="t_est">预计 --</span><span id="t_pos">持仓 0</span></div>
+        <div class="row"><button class="bs buy" id="bbuy">买入</button><button class="bs sell" id="bsell">卖出</button></div>
+        <div id="msg" class="dim"></div>
+      </div>
+      <div id="auto" class="panel">
+        <div class="aihd"><span class="ttl">AI 推理决策</span><span class="chip" id="ai_llm"><i></i>连接中</span><div class="sp"></div>
+          <div class="grp" id="gauto" title="自动交易模式:关闭 / 规则策略(1秒指标) / AI 推理策略(数学闸门+大模型)"><button class="btn" data-m="off">关闭</button><button class="btn" data-m="rule">规则</button><button class="btn" data-m="ai">AI</button></div></div>
+        <div class="gpus" id="ai_gpu"></div>
+        <div id="ai_body"></div>
+        <div class="aift"><button class="btn on" id="ai_run">立即分析</button><button class="btn" id="ai_more">推理详情</button></div>
+      </div>
+    </aside>
+  </div>
+
+  <footer id="foot">
+    <section id="log" class="panel">
+      <div class="top"><span class="ttl">成交日志 · 北京时间</span><span><span class="dim mono" id="l_cnt" style="font-size:.74rem"></span> <button class="btn" id="allog">全部日志 / 导出CSV</button></span></div>
+      <div id="logbody"></div>
+    </section>
+    <section id="stats" class="panel">
+      <div id="ring"><div><b class="mono" id="w_pct">--</b><span>胜率</span></div></div>
+      <div class="kv mono">
+        <span>总成交</span><span id="s_n">0</span>
+        <span>买入 / 卖出</span><span id="s_bs">0 / 0</span>
+        <span>盈利 / 亏损</span><span id="s_wl">0 / 0</span>
+        <span>已实现盈亏</span><span id="s_real">¥0.00</span>
+        <span>累计手续费</span><span id="s_fee">¥0.00</span>
+        <span>胜率口径</span><span class="dim" style="font-size:.7rem">已平仓盈利笔数/卖出笔数</span>
+      </div>
+    </section>
+  </footer>
+</div>
+
+<div id="aimodal"><div id="aimbox"><div class="bar2"><b style="font-size:1.1rem">AI 推理详情 · 数学闸门 · 数据源</b><div class="sp"></div><button class="btn" id="aim_close">关闭</button></div><div id="aim_body"></div></div></div>
+
+<div id="modal"><div id="mbox">
+  <div class="bar2"><b style="font-size:1.1rem">全部成交日志</b><span class="dim mono" id="m_info"></span><div class="sp"></div>
+    <button class="btn" id="m_prev">上一页</button><button class="btn" id="m_next">下一页</button>
+    <button class="btn on" id="m_csv">导出CSV</button><button class="btn" id="m_close">关闭</button></div>
+  <div id="mtable"></div>
+</div></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const TZ = "Asia/Shanghai";
+const dtf = new Intl.DateTimeFormat("sv-SE", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+const fmtDT = (ms) => dtf.format(new Date(ms));
+const fmtT = (ms) => fmtDT(ms).slice(11);
+const rem = () => parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
+const money = (v, sign) => (v == null || isNaN(v) ? "--" : (sign && v > 0 ? "+" : v < 0 ? "-" : "") + "¥" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }));
+const pct = (v, d) => (v == null || isNaN(v) ? "--" : (v > 0 ? "+" : "") + v.toFixed(d == null ? 2 : d) + "%");
+const cls = (v) => (v > 0 ? "up" : v < 0 ? "dn" : "dim");
+const CUR = { USD: "$", CNY: "¥" };
+const MAXT = 7200;
+
+const S = { epoch: 0, ticks: {}, q: [], sig: {}, acct: null, pos: [], stats: null, trades: [], fx: null, feed: null, last: {} };
+let sel = "IBB", mode = "single", winN = 60, showMA = true, showBO = true, mouse = null, busy = false;
+let colors = { up: "#ff3b4e", dn: "#19c37d" };
+const CMP = { IBB: "#3ab4ff", XBI: "#f5b942", "159502": "#c77dff" };
+
+function readColors() {
+  const cs = getComputedStyle(document.body);
+  colors.up = cs.getPropertyValue("--up").trim(); colors.dn = cs.getPropertyValue("--dn").trim();
+}
+function setCC(v) { document.body.dataset.cc = v; localStorage.setItem("cc", v); $("cc").textContent = v === "cn" ? "红涨绿跌" : "绿涨红跌"; readColors(); renderAll(); }
+setCC(localStorage.getItem("cc") || "cn");
+
+const qOf = (c) => S.q.find((x) => x.code === c);
+const fp = (q, p) => (p == null ? "--" : p.toFixed(q ? q.decimals : 2));
+
+/* ---------------- 数据拉取:每秒一次 ---------------- */
+function sinceT() {
+  let m = Infinity;
+  for (const k in S.ticks) { const a = S.ticks[k]; m = Math.min(m, a.length ? a[a.length - 1][0] : 0); }
+  return m === Infinity ? 0 : m;
+}
+async function loop() {
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/api/state?since=" + sinceT(), { cache: "no-store" });
+    const s = await r.json();
+    if (s.error) throw new Error(s.error);
+    apply(s);
+  } catch (e) {
+    const f = $("feed"); f.innerHTML = '<i style="background:#ff3b4e"></i><span style="color:#ff3b4e">连接中断,重试中…</span>';
+  }
+  setTimeout(loop, Math.max(80, 1000 - (performance.now() - t0)));
+}
+function apply(s) {
+  if (S.epoch && S.epoch !== s.epoch) S.ticks = {};
+  S.epoch = s.epoch;
+  const prev = {}; S.q.forEach((x) => (prev[x.code] = x.price));
+  S.prevPx = prev;
+  for (const c in s.ticks) {
+    const arr = (S.ticks[c] = S.ticks[c] || []);
+    for (const t of s.ticks[c]) if (!arr.length || t[0] > arr[arr.length - 1][0]) arr.push(t);
+    if (arr.length > MAXT) arr.splice(0, arr.length - MAXT);
+  }
+  if (s.ticks) for (const c in S.ticks) { if (!s.ticks[c]) continue; }
+  if (res !== "tick" && mode === "single") loadHist(sel, res);
+  S.q = s.quotes; S.sig = s.signals; S.acct = s.account; S.pos = s.positions; S.stats = s.stats; S.trades = s.trades; S.fx = s.fx; S.feed = s.feed; S.now = s.ts;
+  renderAll();
+}
+
+/* ---------------- 渲染 ---------------- */
+function renderAll() {
+  if (!S.acct) return;
+  renderHeader(); renderCards(); renderCenter(); renderAccount(); renderTrade(); renderLog(); renderStats(); drawMain();
+}
+function renderHeader() {
+  $("mkts").innerHTML = ["US", "CN"].map((m) => {
+    const q = S.q.find((x) => x.market === m);
+    return q ? '<span class="chip ' + q.state + '"><i></i>' + (m === "US" ? "美股 " : "A股 ") + q.stateLabel + "</span>" : "";
+  }).join("");
+  const f = S.feed, anySim = S.q.some((q) => q.feed === "sim"), anyStale = S.q.some((q) => q.feed === "stale");
+  let h;
+  if (anySim) h = '<i style="background:#f5b942"></i><span style="color:#f5b942">模拟行情(外网不可用,仅演示)</span>';
+  else if (anyStale || !f.ok) h = '<i style="background:#f5b942"></i><span style="color:#f5b942">行情延迟 · ' + (f.error || "stale") + "</span>";
+  else h = '<i style="background:#19c37d;box-shadow:0 0 .5rem #19c37d"></i><span>实时 · ' + f.name + " · " + f.latency + "ms · 1秒刷新</span>";
+  $("feed").innerHTML = h;
+  $("fx").textContent = "USD/CNY " + S.fx.rate.toFixed(4) + (S.fx.src === "default" ? " (兜底)" : "");
+}
+function renderCards() {
+  const box = $("left");
+  if (!box.children.length) {
+    box.innerHTML = S.q.map((q) => '<div class="panel card" data-code="' + q.code + '"><div class="r1"><span class="code">' + q.code + '</span><span class="chip st"></span></div><div class="nm">' + q.name + '</div><div class="px mono"></div><div class="chg mono"></div><canvas></canvas><div class="mini mono"></div><div class="pos"></div></div>').join("");
+    box.addEventListener("click", (e) => { const c = e.target.closest(".card"); if (c) { sel = c.dataset.code; $("qty").value = qOf(sel).lot; V.off = 0; G.anchorT = 0; if (res !== "tick") loadHist(sel, res, true); renderAll(); renderAI(); } });
+  }
+  S.q.forEach((q, i) => {
+    const el = box.children[i];
+    el.classList.toggle("sel", q.code === sel);
+    const st = el.querySelector(".st"); st.className = "chip st " + q.state; st.innerHTML = "<i></i>" + q.stateLabel;
+    const px = el.querySelector(".px"); const txt = CUR[q.currency] + fp(q, q.price);
+    if (px.textContent !== txt) {
+      const pv = S.prevPx && S.prevPx[q.code];
+      px.textContent = txt;
+      if (pv != null && q.price !== pv) { px.classList.remove("flash-up", "flash-dn"); void px.offsetWidth; px.classList.add(q.price > pv ? "flash-up" : "flash-dn"); }
+    }
+    px.className = "px mono " + cls(q.change) + (px.classList.contains("flash-up") ? " flash-up" : px.classList.contains("flash-dn") ? " flash-dn" : "");
+    const ch = el.querySelector(".chg"); ch.className = "chg mono " + cls(q.change);
+    ch.textContent = (q.change > 0 ? "+" : "") + fp(q, q.change) + "  " + pct(q.pct);
+    el.querySelector(".mini").innerHTML = "<span>开 " + fp(q, q.open) + "</span><span>昨收 " + fp(q, q.prevClose) + "</span><span>高 " + fp(q, q.high) + "</span><span>低 " + fp(q, q.low) + "</span><span style='grid-column:1/3'>报价时间 " + (q.quoteTime ? fmtDT(q.quoteTime).slice(5) : "--") + "</span>";
+    const p = S.pos.find((x) => x.symbol === q.code);
+    el.querySelector(".pos").innerHTML = p ? '持仓 <b class="mono">' + p.qty + '</b> · 浮盈 <span class="mono ' + cls(p.pnlCny) + '">' + money(p.pnlCny, 1) + " (" + pct(p.pnlPct * 100) + ")</span>" : "无持仓";
+    spark(el.querySelector("canvas"), q);
+  });
+}
+function spark(cv, q) {
+  const { x, w, h } = prep(cv); x.clearRect(0, 0, w, h);
+  const a = (S.ticks[q.code] || []).slice(-180); if (a.length < 2) return;
+  let mn = Infinity, mx = -Infinity; a.forEach((t) => { mn = Math.min(mn, t[1]); mx = Math.max(mx, t[1]); });
+  if (mx === mn) { mx += 1e-6; mn -= 1e-6; }
+  const col = q.change >= 0 ? colors.up : colors.dn;
+  x.beginPath(); a.forEach((t, i) => { const X = (i / (a.length - 1)) * w, Y = h - 2 - ((t[1] - mn) / (mx - mn)) * (h - 4); i ? x.lineTo(X, Y) : x.moveTo(X, Y); });
+  x.strokeStyle = col; x.lineWidth = 1.5; x.stroke();
+  x.lineTo(w, h); x.lineTo(0, h); x.closePath();
+  const g = x.createLinearGradient(0, 0, 0, h); g.addColorStop(0, col + "44"); g.addColorStop(1, col + "00"); x.fillStyle = g; x.fill();
+}
+function renderCenter() {
+  const q = qOf(sel); if (!q) return;
+  $("ctitle").innerHTML = q.code + ' <span class="dim" style="font-size:.85rem;font-weight:400">' + q.name + "</span>";
+  const px = $("cpx"); px.textContent = CUR[q.currency] + fp(q, q.price); px.className = "px mono " + cls(q.change);
+  const ch = $("cchg"); ch.textContent = (q.change > 0 ? "+" : "") + fp(q, q.change) + "  " + pct(q.pct); ch.className = "mono " + cls(q.change);
+  const s = S.sig[sel];
+  const f = (v, d) => (v == null ? "--" : v.toFixed(d));
+  const dd = q.decimals;
+  if (s && s.ready) {
+    $("i_ma30").textContent = f(s.maFast, dd); $("i_ma120").textContent = f(s.maSlow, dd);
+    $("i_rsi").textContent = f(s.rsi, 1); $("i_rsi").className = "mono " + (s.rsi < 30 ? "dn" : s.rsi > 70 ? "up" : "");
+    $("i_boll").textContent = f(s.bollUp, dd) + " / " + f(s.bollLow, dd);
+    $("i_score").textContent = (s.score > 0 ? "+" : "") + s.score; $("i_score").className = "mono " + (s.score > 0 ? "up" : s.score < 0 ? "dn" : "dim");
+    const lab = { BUY: "买入信号", SELL: "卖出信号", HOLD: "观望" };
+    $("i_sig").className = "sig " + s.action; $("i_sig").textContent = lab[s.action];
+    $("i_reason").textContent = s.reasons.join(" · ") || "无显著信号";
+    $("warm").style.width = "100%";
+  } else {
+    ["i_ma30", "i_ma120", "i_rsi", "i_boll", "i_score"].forEach((k) => ($(k).textContent = "--"));
+    $("i_sig").className = "sig HOLD"; $("i_sig").textContent = "预热 " + (s ? s.warm : 0) + "/" + (s ? s.need : 120) + "s";
+    $("i_reason").textContent = "指标基于 1 秒采样,采满 120 秒后启用";
+    $("warm").style.width = (s ? Math.min(100, (s.warm / s.need) * 100) : 0) + "%";
+  }
+}
+function renderAccount() {
+  const a = S.acct;
+  $("a_eq").textContent = money(a.equity).replace("+", "");
+  const r = $("a_ret"); r.className = "mono " + cls(a.returnPct); r.textContent = "总收益 " + pct(a.returnPct) + "  ·  本金 " + money(a.initial);
+  $("a_cash").textContent = money(a.cash); $("a_mv").textContent = money(a.marketValue);
+  $("a_real").textContent = money(a.realized, 1); $("a_real").className = "mono " + cls(a.realized);
+  $("a_unreal").textContent = money(a.unrealized, 1); $("a_unreal").className = "mono " + cls(a.unrealized);
+  const am = a.autoMode || (a.auto ? "rule" : "off");
+  [...$("gauto").children].forEach((c) => c.classList.toggle("on", c.dataset.m === am));
+}
+function fxOf(q) { return q.currency === "CNY" ? 1 : S.fx.rate; }
+function renderTrade() {
+  const q = qOf(sel); if (!q) return;
+  $("t_sym").textContent = q.code; $("t_lot").textContent = "最小单位 " + q.lot;
+  const qty = parseInt($("qty").value, 10) || 0;
+  const amt = q.price * qty * fxOf(q);
+  $("t_est").textContent = "预计 " + money(amt * 1.0003).replace("+", "") + (q.currency === "USD" ? " (" + CUR.USD + (q.price * qty).toFixed(2) + ")" : "");
+  const p = S.pos.find((x) => x.symbol === sel);
+  $("t_pos").textContent = "持仓 " + (p ? p.qty : 0);
+}
+function renderLog() {
+  const body = $("logbody");
+  const rowH = 1.55 * rem(), headH = 1.5 * rem();
+  const max = Math.max(1, Math.floor((body.clientHeight - headH) / rowH));
+  $("l_cnt").textContent = "共 " + S.stats.trades + " 笔 · 显示最近 " + Math.min(max, S.trades.length) + " 笔";
+  if (!S.trades.length) { body.innerHTML = '<div class="empty">暂无成交 — 在右侧"模拟下单"买入或开启自动策略,每笔都会精确记录于此</div>'; return; }
+  body.innerHTML = tableHTML(S.trades.slice(0, max));
+}
+function tableHTML(rows) {
+  const h = "<table><thead><tr><th>时间</th><th>标的</th><th>方向</th><th>成交价</th><th>数量</th><th>成交额(¥)</th><th>手续费</th><th>盈亏(¥)</th><th>来源</th><th style='text-align:left'>备注</th></tr></thead><tbody>";
+  return h + rows.map((t) => {
+    const q = qOf(t.symbol); const d = q ? q.decimals : 2;
+    return "<tr class='mono'><td>" + fmtDT(t.ts).slice(5) + "</td><td>" + t.symbol + "</td><td><span class='tag " + t.side + "'>" + (t.side === "BUY" ? "买入" : "卖出") + "</span></td><td>" + (CUR[t.currency] || "") + t.price.toFixed(d) + "</td><td>" + t.qty + "</td><td>" + t.amountCny.toFixed(2) + "</td><td class='dim'>" + t.feeCny.toFixed(2) + "</td><td class='" + (t.pnlCny == null ? "dim" : cls(t.pnlCny)) + "'>" + (t.pnlCny == null ? "--" : (t.pnlCny > 0 ? "+" : "") + t.pnlCny.toFixed(2) + " (" + pct(t.pnlPct * 100) + ")") + "</td><td>" + (t.source === "ai" ? "<span class='gold'>AI</span>" : t.source === "auto" ? "<span class='acc'>自动</span>" : "手动") + "</td><td class='note'>" + (t.note || (t.feed === "sim" ? "模拟行情" : "")) + "</td></tr>";
+  }).join("") + "</tbody></table>";
+}
+function renderStats() {
+  const s = S.stats, a = S.acct;
+  const wr = s.winRate;
+  $("w_pct").textContent = wr == null ? "--" : wr.toFixed(1) + "%";
+  const ring = $("ring");
+  if (wr == null) ring.style.background = "conic-gradient(#1a2434 0 100%)";
+  else ring.style.background = "conic-gradient(" + colors.up + " 0 " + wr + "%, " + colors.dn + " " + wr + "% 100%)";
+  $("s_n").textContent = s.trades; $("s_bs").textContent = s.buys + " / " + s.sells; $("s_wl").textContent = s.wins + " / " + s.losses;
+  $("s_real").textContent = money(a.realized, 1); $("s_real").className = cls(a.realized);
+  $("s_fee").textContent = money(a.fees);
+}
+
+/* ---------------- 图表 ---------------- */
+function prep(cv) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const x = cv.getContext("2d"); x.setTransform(dpr, 0, 0, dpr, 0, 0); return { x, w, h };
+}
+const memo = {};
+function indic(code) {
+  const a = S.ticks[code] || []; const key = code + ":" + a.length + ":" + (a.length ? a[a.length - 1][0] : 0);
+  if (memo[code] && memo[code].key === key) return memo[code];
+  const n = a.length, p = new Float64Array(n), c1 = new Float64Array(n + 1), c2 = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) { p[i] = a[i][1]; c1[i + 1] = c1[i] + p[i]; c2[i + 1] = c2[i] + p[i] * p[i]; }
+  const ma = (w) => { const o = new Array(n).fill(null); for (let i = w - 1; i < n; i++) o[i] = (c1[i + 1] - c1[i + 1 - w]) / w; return o; };
+  const m30 = ma(30), m120 = ma(120), up = new Array(n).fill(null), lo = new Array(n).fill(null);
+  for (let i = 119; i < n; i++) { const m = m120[i]; const v = Math.max(0, (c2[i + 1] - c2[i - 119]) / 120 - m * m); const sd = Math.sqrt(v); up[i] = m + 2 * sd; lo[i] = m - 2 * sd; }
+  return (memo[code] = { key, m30, m120, up, lo });
+}
+function niceTicks(mn, mx, k) { const s = (mx - mn) / k; const o = []; for (let i = 0; i <= k; i++) o.push(mn + s * i); return o; }
+/* ---- 图表:时间分辨率(秒/1分/5分/15分/日) + 左键拖动平移 + 滚轮缩放 + 十字光标 ---- */
+const RES = { tick: { sec: 1 }, "1m": { sec: 60 }, "5m": { sec: 300 }, "15m": { sec: 900 }, "1d": { sec: 86400 } };
+const DEF_CNT = { tick: 120, "1m": 120, "5m": 100, "15m": 100, "1d": 90 };
+let res = "tick";
+const V = { count: 120, off: 0 };
+const G = { L: 0, cw: 1, T: 0, ch: 1, n: 0, i0: 0, i1: 1, anchorT: 0, anchorKey: "" };
+const HB = {};
+let drag = null;
+const serMemo = {};
+
+function calcInd(c, fa, sl, bn) {
+  const n = c.length, c1 = new Float64Array(n + 1), c2 = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) { c1[i + 1] = c1[i] + c[i]; c2[i + 1] = c2[i] + c[i] * c[i]; }
+  const ma = (w) => { const o = new Array(n).fill(null); for (let i = w - 1; i < n; i++) o[i] = (c1[i + 1] - c1[i + 1 - w]) / w; return o; };
+  const mf = ma(fa), ms = ma(sl), up = new Array(n).fill(null), lo = new Array(n).fill(null);
+  for (let i = bn - 1; i < n; i++) { const m = (c1[i + 1] - c1[i + 1 - bn]) / bn; const sd = Math.sqrt(Math.max(0, (c2[i + 1] - c2[i + 1 - bn]) / bn - m * m)); up[i] = m + 2 * sd; lo[i] = m - 2 * sd; }
+  return { mf, ms, up, lo, fa, sl, bn };
+}
+function bsearch(t, v) { let lo = 0, hi = t.length - 1, a = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (t[m] <= v) { a = m; lo = m + 1; } else hi = m - 1; } return a; }
+
+function buildSeries(code) {
+  const q = qOf(code);
+  if (res === "tick") {
+    const a = S.ticks[code] || [];
+    const key = "tick:" + code + ":" + a.length + ":" + (a.length ? a[a.length - 1][0] : 0);
+    if (serMemo[code + "tick"] && serMemo[code + "tick"].key === key) return serMemo[code + "tick"];
+    const n = a.length, t = new Array(n), c = new Array(n);
+    for (let i = 0; i < n; i++) { t[i] = a[i][0]; c[i] = a[i][1]; }
+    return (serMemo[code + "tick"] = { key, kind: "tick", n, t, o: c, h: c, l: c, c, v: null, ind: calcInd(c, 30, 120, 120), labs: ["MA30", "MA120", "布林(120)"] });
+  }
+  const hb = HB[code + ":" + res];
+  if (!hb || !hb.bars.length) return null;
+  const B = hb.bars, sec = RES[res].sec * 1000, price = q ? q.price : 0;
+  const mk = code + res;
+  const key = [res, code, hb.at, B.length, price].join(":");
+  if (serMemo[mk] && serMemo[mk].key === key) return serMemo[mk];
+  const n0 = B.length, t = new Array(n0), o = new Array(n0), h = new Array(n0), l = new Array(n0), c = new Array(n0), v = new Array(n0);
+  for (let i = 0; i < n0; i++) { const b = B[i]; t[i] = b[0]; o[i] = b[1]; h[i] = b[2]; l[i] = b[3]; c[i] = b[4]; v[i] = b[5]; }
+  const now = Date.now(), last = n0 - 1;
+  if (price > 0 && q && q.state !== "closed") {
+    if (now >= t[last] && now < t[last] + sec) { c[last] = price; h[last] = Math.max(h[last], price); l[last] = Math.min(l[last], price); }
+    else if (res !== "1d" && q.state === "open" && now >= t[last] + sec) { const nt = t[last] + Math.floor((now - t[last]) / sec) * sec; t.push(nt); o.push(price); h.push(price); l.push(price); c.push(price); v.push(0); }
+  }
+  return (serMemo[mk] = { key, kind: "bar", n: t.length, t, o, h, l, c, v, ind: calcInd(c, 20, 60, 20), labs: ["MA20", "MA60", "布林(20)"] });
+}
+async function loadHist(code, tf, force) {
+  const k = code + ":" + tf; const hb = HB[k] || (HB[k] = { bars: [], at: 0, loading: false, err: "", src: "" });
+  if (hb.loading) return;
+  if (!force && hb.bars.length && Date.now() - hb.at < (tf === "1m" ? 20000 : 45000)) return;
+  if (!force && !hb.bars.length && hb.err && Date.now() - hb.at < 8000) return;
+  hb.loading = true;
+  try {
+    const j = await (await fetch("/api/history?code=" + code + "&tf=" + tf, { cache: "no-store" })).json();
+    if (j.bars && j.bars.length) { hb.bars = j.bars; hb.src = j.src || ""; hb.err = ""; } else hb.err = j.err || j.error || "无数据";
+  } catch (e) { hb.err = "网络错误"; }
+  hb.at = Date.now(); hb.loading = false; drawMain();
+}
+function windowOf(n) {
+  const cnt = Math.max(10, Math.min(Math.round(V.count), Math.max(n, 10)));
+  V.off = Math.max(0, Math.min(V.off, Math.max(0, n - cnt)));
+  const i1 = n - Math.round(V.off), i0 = Math.max(0, i1 - cnt);
+  return [i0, i1];
+}
+function fmtAx(ms, span) {
+  const s = fmtDT(ms);
+  if (res === "tick") return s.slice(11);
+  if (res === "1d") return s.slice(2, 10);
+  return span > 86400000 * 1.2 ? s.slice(5, 16) : s.slice(11, 16);
+}
+function drawMain() {
+  const cv = $("chart"); const { x, w, h } = prep(cv); x.clearRect(0, 0, w, h);
+  const r = rem(), L = 0.8 * r, R = 5.6 * r, T = 1.9 * r, B = 1.8 * r, cw = w - L - R, ch = h - T - B;
+  G.L = L; G.cw = cw; G.T = T; G.ch = ch;
+  x.font = Math.round(0.78 * r) + "px SF Mono,Menlo,Consolas,monospace"; x.textBaseline = "middle";
+  const q0 = qOf(sel); if (!q0) return;
+  const single = mode === "single", dec = q0.decimals;
+  const say0 = (t) => { x.fillStyle = "#6a7a91"; x.textAlign = "center"; x.fillText(t, w / 2, h / 2); };
+  let ser = null, n = 0, cmp = null;
+  if (single) {
+    ser = buildSeries(sel);
+    if (!ser || ser.n < 2) {
+      const hb = HB[sel + ":" + res];
+      say0(res === "tick" ? "等待行情数据…" : hb && hb.err && !hb.bars.length ? "历史K线加载失败:" + hb.err + "(自动重试中)" : "加载历史K线…");
+      return;
+    }
+    n = ser.n;
+  } else {
+    const codes = S.q.map((q) => q.code); let nn = Infinity; codes.forEach((c) => (nn = Math.min(nn, (S.ticks[c] || []).length)));
+    if (!isFinite(nn) || nn < 2) { say0("等待行情数据…"); return; }
+    n = nn;
+    cmp = codes.map((c) => { const a = S.ticks[c], st = a.length - n; return { code: c, t: a.slice(st).map((p) => p[0]), c: a.slice(st).map((p) => p[1]) }; });
+  }
+  const tAll = single ? ser.t : cmp[0].t, skey = (single ? sel : "cmp") + res + mode;
+  if (V.off > 0 && G.anchorKey === skey && G.anchorT) { const ix = bsearch(tAll, G.anchorT); if (ix >= 0) V.off = n - 1 - ix; }
+  const [i0, i1] = windowOf(n), cnt = i1 - i0;
+  G.n = n; G.i0 = i0; G.i1 = i1;
+  G.anchorKey = skey; G.anchorT = V.off > 0 ? tAll[i1 - 1] : 0;
+  const Xi = (i) => L + ((i - i0 + 0.5) / cnt) * cw;
+  let mn = Infinity, mx = -Infinity, vals = null;
+  if (single) {
+    for (let i = i0; i < i1; i++) { mn = Math.min(mn, ser.l[i]); mx = Math.max(mx, ser.h[i]); }
+    if (showMA) for (let i = i0; i < i1; i++) for (const arr of [ser.ind.mf, ser.ind.ms]) { const v = arr[i]; if (v != null) { mn = Math.min(mn, v); mx = Math.max(mx, v); } }
+  } else {
+    vals = cmp.map((s) => { const b = s.c[i0]; return { code: s.code, v: s.c.slice(i0, i1).map((p) => (p / b - 1) * 100) }; });
+    vals.forEach((s) => s.v.forEach((v) => { mn = Math.min(mn, v); mx = Math.max(mx, v); }));
+  }
+  if (mx - mn < 1e-9) { const e = Math.abs(mx) * 0.0005 || 0.001; mx += e; mn -= e; }
+  const pad = (mx - mn) * 0.1; mn -= pad; mx += pad;
+  const Y = (v) => T + (1 - (v - mn) / (mx - mn)) * ch;
+  // 网格与坐标
+  x.strokeStyle = "#101a27"; x.lineWidth = 1; x.fillStyle = "#6a7a91"; x.textAlign = "left";
+  for (const v of niceTicks(mn, mx, 8)) { const y = Math.round(Y(v)) + 0.5; x.beginPath(); x.moveTo(L, y); x.lineTo(L + cw, y); x.stroke(); x.fillText(single ? v.toFixed(dec) : pct(v), L + cw + 0.5 * r, y); }
+  const span = tAll[i1 - 1] - tAll[i0]; x.textAlign = "center";
+  for (let k = 0; k <= 6; k++) { const i = Math.min(i1 - 1, i0 + Math.round((k * (cnt - 1)) / 6)); const X = Xi(i); x.strokeStyle = "#0b131e"; x.beginPath(); x.moveTo(Math.round(X) + 0.5, T); x.lineTo(Math.round(X) + 0.5, T + ch); x.stroke(); x.fillStyle = "#6a7a91"; x.fillText(fmtAx(tAll[i], span), Math.min(Math.max(X, L + 3 * r), L + cw - 3 * r), h - B / 2 + 2); }
+  x.save(); x.beginPath(); x.rect(L, T, cw, ch); x.clip();
+  const lineAt = (arr, color, lw) => { x.beginPath(); let st = false; for (let i = i0; i < i1; i++) { const v = arr[i]; if (v == null) continue; st ? x.lineTo(Xi(i), Y(v)) : x.moveTo(Xi(i), Y(v)); st = true; } x.strokeStyle = color; x.lineWidth = lw; x.stroke(); };
+  if (single) {
+    if (showBO) {
+      x.beginPath(); let st = false;
+      for (let i = i0; i < i1; i++) { const v = ser.ind.up[i]; if (v == null) continue; st ? x.lineTo(Xi(i), Y(v)) : x.moveTo(Xi(i), Y(v)); st = true; }
+      for (let i = i1 - 1; i >= i0; i--) { const v = ser.ind.lo[i]; if (v == null) continue; x.lineTo(Xi(i), Y(v)); }
+      x.closePath(); x.fillStyle = "rgba(58,180,255,.07)"; x.fill(); x.setLineDash([4, 4]);
+      lineAt(ser.ind.up, "rgba(58,180,255,.4)", 1); lineAt(ser.ind.lo, "rgba(58,180,255,.4)", 1); x.setLineDash([]);
+    }
+    if (ser.kind === "tick") {
+      const col = ser.c[i1 - 1] >= ser.c[i0] ? colors.up : colors.dn;
+      x.beginPath(); for (let i = i0; i < i1; i++) (i > i0 ? x.lineTo(Xi(i), Y(ser.c[i])) : x.moveTo(Xi(i), Y(ser.c[i])));
+      x.strokeStyle = col; x.lineWidth = 2.2; x.lineJoin = "round"; x.stroke();
+      x.lineTo(Xi(i1 - 1), T + ch); x.lineTo(Xi(i0), T + ch); x.closePath();
+      const g = x.createLinearGradient(0, T, 0, T + ch); g.addColorStop(0, col + "40"); g.addColorStop(1, col + "00"); x.fillStyle = g; x.fill();
+    } else {
+      const bw = Math.max(1, Math.min(cw / cnt * 0.72, 18 * r));
+      for (let i = i0; i < i1; i++) {
+        const up = ser.c[i] >= ser.o[i], col = up ? colors.up : colors.dn, X = Math.round(Xi(i)) + 0.5;
+        x.strokeStyle = col; x.fillStyle = col; x.lineWidth = 1;
+        x.beginPath(); x.moveTo(X, Y(ser.h[i])); x.lineTo(X, Y(ser.l[i])); x.stroke();
+        const yo = Y(ser.o[i]), yc = Y(ser.c[i]); x.fillRect(X - bw / 2, Math.min(yo, yc), bw, Math.max(1, Math.abs(yo - yc)));
+      }
+    }
+    if (showMA) { lineAt(ser.ind.ms, "#c77dff", 1.4); lineAt(ser.ind.mf, "#f5b942", 1.4); }
+    if (q0.prevClose > mn && q0.prevClose < mx) { x.strokeStyle = "#344256"; x.setLineDash([2, 5]); x.beginPath(); x.moveTo(L, Y(q0.prevClose)); x.lineTo(L + cw, Y(q0.prevClose)); x.stroke(); x.setLineDash([]); }
+    // 成交标记(按时间二分定位到K线)
+    const barMs = res === "tick" ? 1500 : RES[res].sec * 1000;
+    for (const tr of S.trades) {
+      if (tr.symbol !== sel) continue;
+      const i = bsearch(ser.t, tr.ts); if (i < i0 || i >= i1 || tr.ts > ser.t[i] + barMs + 1500) continue;
+      const X = Xi(i), Yv = Y(tr.price), buy = tr.side === "BUY";
+      x.fillStyle = buy ? colors.up : colors.dn; x.beginPath();
+      if (buy) { x.moveTo(X, Yv + 3); x.lineTo(X - 7, Yv + 17); x.lineTo(X + 7, Yv + 17); } else { x.moveTo(X, Yv - 3); x.lineTo(X - 7, Yv - 17); x.lineTo(X + 7, Yv - 17); }
+      x.closePath(); x.fill(); x.fillStyle = "#fff"; x.textAlign = "center"; x.font = "bold " + Math.round(0.7 * r) + "px sans-serif"; x.fillText(tr.source === "ai" ? (buy ? "AI买" : "AI卖") : buy ? "买" : "卖", X, buy ? Yv + 13 : Yv - 12);
+    }
+  } else {
+    x.strokeStyle = "#344256"; x.setLineDash([2, 5]); x.beginPath(); x.moveTo(L, Y(0)); x.lineTo(L + cw, Y(0)); x.stroke(); x.setLineDash([]);
+    vals.forEach((s) => { x.beginPath(); s.v.forEach((v, k) => (k ? x.lineTo(Xi(i0 + k), Y(v)) : x.moveTo(Xi(i0 + k), Y(v)))); x.strokeStyle = CMP[s.code]; x.lineWidth = 2; x.stroke(); });
+  }
+  x.restore();
+  // 最新价标签(在可见范围内才画)
+  x.font = "bold " + Math.round(0.8 * r) + "px SF Mono,Menlo,Consolas,monospace"; x.textAlign = "left";
+  const lastIdx = i1 - 1;
+  (single ? [{ code: sel, v: ser.c[lastIdx], col: ser.c[lastIdx] >= (ser.kind === "tick" ? ser.c[i0] : ser.o[i0]) ? colors.up : colors.dn }] : vals.map((s) => ({ code: s.code, v: s.v[s.v.length - 1], col: CMP[s.code] }))).forEach((s) => {
+    const y = Y(s.v); if (y < T || y > T + ch) return;
+    x.strokeStyle = s.col; x.globalAlpha = 0.5; x.setLineDash([3, 3]); x.beginPath(); x.moveTo(L, y); x.lineTo(L + cw, y); x.stroke(); x.setLineDash([]); x.globalAlpha = 1;
+    x.fillStyle = s.col; x.fillRect(L + cw, y - 0.8 * r, R - 0.2 * r, 1.6 * r); x.fillStyle = "#000";
+    x.fillText(single ? s.v.toFixed(dec) : s.code + " " + pct(s.v, 2), L + cw + 0.3 * r, y);
+    if (V.off === 0) { x.beginPath(); x.arc(Xi(lastIdx), y, 3.5, 0, 7); x.fillStyle = s.col; x.fill(); }
+  });
+  // 图例与状态
+  x.font = Math.round(0.78 * r) + "px SF Mono,Menlo,Consolas,monospace"; x.textAlign = "left";
+  let lx = L + 0.6 * r; const ly = 0.95 * r;
+  if (single) { [["#f5b942", ser.labs[0]], ["#c77dff", ser.labs[1]], ["rgba(58,180,255,.9)", ser.labs[2]]].forEach(([c, t]) => { x.fillStyle = c; x.fillRect(lx, ly - 1, 1.1 * r, 3); x.fillText(t, lx + 1.4 * r, ly); lx += (t.length * 0.62 + 3.4) * r; }); }
+  else vals.forEach((s) => { x.fillStyle = CMP[s.code]; x.fillRect(lx, ly - 1, 1.1 * r, 3); x.fillText(s.code, lx + 1.4 * r, ly); lx += 7 * r; });
+  const hb = HB[sel + ":" + res];
+  const resName = { tick: "秒级(实时采样)", "1m": "1分钟K", "5m": "5分钟K", "15m": "15分钟K", "1d": "日K" }[res];
+  x.textAlign = "right"; x.fillStyle = "#4b5b72";
+  x.fillText((single ? resName + (hb && hb.src && res !== "tick" ? " · " + hb.src : "") : "对比模式(秒级)") + " · 显示 " + cnt + "/" + n + (V.off > 0 ? " · 历史" : " · 最新") + " · 左键拖动 · 滚轮缩放 · 双击复位", L + cw, ly);
+  if (mouse && !drag && mouse.x >= L && mouse.x <= L + cw && mouse.y >= T && mouse.y <= T + ch) {
+    const i = Math.max(i0, Math.min(i1 - 1, i0 + Math.floor(((mouse.x - L) / cw) * cnt)));
+    x.strokeStyle = "#5b6b82"; x.setLineDash([3, 3]); x.beginPath(); x.moveTo(Xi(i), T); x.lineTo(Xi(i), T + ch); x.moveTo(L, mouse.y); x.lineTo(L + cw, mouse.y); x.stroke(); x.setLineDash([]);
+    let txt = fmtDT(tAll[i]).slice(res === "1d" ? 0 : 5);
+    if (single) { txt += ser.kind === "tick" ? "   价 " + ser.c[i].toFixed(dec) : "   开 " + ser.o[i].toFixed(dec) + " 高 " + ser.h[i].toFixed(dec) + " 低 " + ser.l[i].toFixed(dec) + " 收 " + ser.c[i].toFixed(dec) + (ser.v[i] ? "  量 " + Math.round(ser.v[i]) : ""); }
+    else txt += "   " + vals.map((s) => s.code + " " + pct(s.v[i - i0], 2)).join("  ");
+    x.textAlign = "left"; x.font = Math.round(0.8 * r) + "px SF Mono,Menlo,Consolas,monospace";
+    const tw = x.measureText(txt).width + 1.2 * r; x.fillStyle = "rgba(8,14,22,.92)"; x.fillRect(L + 0.4 * r, T + 0.2 * r, tw, 1.6 * r); x.fillStyle = "#fff"; x.fillText(txt, L + r, T + r);
+    const yv = mn + (1 - (mouse.y - T) / ch) * (mx - mn);
+    x.fillStyle = "#2a3a50"; x.fillRect(L + cw, mouse.y - 0.7 * r, R - 0.2 * r, 1.4 * r); x.fillStyle = "#fff"; x.fillText(single ? yv.toFixed(dec) : pct(yv), L + cw + 0.3 * r, mouse.y);
+  }
+}
+
+/* ---------------- 交互 ---------------- */
+const cvEl = $("chart");
+cvEl.addEventListener("mousedown", (e) => { if (e.button !== 0) return; drag = { x: e.clientX, off: V.off }; cvEl.classList.add("drag"); e.preventDefault(); });
+window.addEventListener("mouseup", () => { if (drag) { drag = null; cvEl.classList.remove("drag"); drawMain(); } });
+window.addEventListener("mousemove", (e) => {
+  if (drag) { const per = G.cw / Math.max(1, G.i1 - G.i0); V.off = drag.off + (e.clientX - drag.x) / per; drawMain(); }
+});
+cvEl.addEventListener("mousemove", (e) => { const b = cvEl.getBoundingClientRect(); mouse = { x: e.clientX - b.left, y: e.clientY - b.top }; if (!drag) drawMain(); });
+cvEl.addEventListener("mouseleave", () => { mouse = null; drawMain(); });
+cvEl.addEventListener("dblclick", () => { V.count = DEF_CNT[res]; V.off = 0; drawMain(); });
+cvEl.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const b = cvEl.getBoundingClientRect(), mx = e.clientX - b.left, n = G.n || 0; if (n < 2) return;
+  const cnt = G.i1 - G.i0, frac = Math.max(0, Math.min(1, (mx - G.L) / G.cw)), anchor = G.i0 + frac * cnt;
+  const nc = Math.max(10, Math.min(Math.max(n, 10), cnt * Math.exp(e.deltaY * 0.0016)));
+  V.count = nc; V.off = n - (anchor - frac * nc + nc);
+  drawMain();
+}, { passive: false });
+window.addEventListener("resize", () => S.acct && renderAll());
+$("gmode").addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; mode = b.dataset.mode; [...$("gmode").children].forEach((c) => c.classList.toggle("on", c === b)); drawMain(); });
+function setRes(r2) { res = r2; V.count = DEF_CNT[r2]; V.off = 0; G.anchorT = 0; [...$("gres").children].forEach((c) => c.classList.toggle("on", c.dataset.res === r2)); if (r2 !== "tick") loadHist(sel, r2, true); drawMain(); }
+$("gres").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) setRes(b.dataset.res); });
+$("gnow").onclick = () => { V.off = 0; drawMain(); };
+$("tma").onclick = () => { showMA = !showMA; $("tma").classList.toggle("on", showMA); drawMain(); };
+$("tbo").onclick = () => { showBO = !showBO; $("tbo").classList.toggle("on", showBO); drawMain(); };
+$("cc").onclick = () => setCC(document.body.dataset.cc === "cn" ? "us" : "cn");
+
+$("qty").addEventListener("input", renderTrade);
+$("qm").onclick = () => { const q = qOf(sel); $("qty").value = Math.max(q.lot, (parseInt($("qty").value, 10) || 0) - q.lot); renderTrade(); };
+$("qp").onclick = () => { const q = qOf(sel); $("qty").value = (parseInt($("qty").value, 10) || 0) + q.lot; renderTrade(); };
+document.querySelector("#trade").addEventListener("click", (e) => {
+  const b = e.target.closest(".qk"); if (!b) return; const q = qOf(sel);
+  if (b.dataset.b) { const unit = q.price * fxOf(q) * 1.0003 * q.lot; $("qty").value = Math.max(q.lot, Math.floor((S.acct.cash * +b.dataset.b) / unit) * q.lot); }
+  else { const p = S.pos.find((x) => x.symbol === sel); const have = p ? p.qty : 0; $("qty").value = Math.max(q.lot, Math.floor((have * +b.dataset.s) / q.lot) * q.lot); }
+  renderTrade();
+});
+let msgTimer;
+function say(t, ok) { const m = $("msg"); m.textContent = t; m.style.color = ok ? "var(--acc)" : "var(--warn)"; clearTimeout(msgTimer); msgTimer = setTimeout(() => (m.textContent = ""), 6000); }
+async function order(side) {
+  if (busy) return; busy = true; $("bbuy").disabled = $("bsell").disabled = true;
+  try {
+    const r = await fetch("/api/trade", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ symbol: sel, side, qty: parseInt($("qty").value, 10) }) });
+    const j = await r.json();
+    if (j.ok) { const t = j.trade, q = qOf(sel); say((side === "BUY" ? "✔ 买入 " : "✔ 卖出 ") + t.symbol + " " + t.qty + " @ " + CUR[t.currency] + t.price.toFixed(q.decimals) + (t.pnlCny != null ? "  盈亏 " + money(t.pnlCny, 1) : ""), true); }
+    else say("✘ " + (j.error || "下单失败"), false);
+  } catch (e) { say("✘ 网络错误", false); }
+  busy = false; $("bbuy").disabled = $("bsell").disabled = false;
+}
+$("bbuy").onclick = () => order("BUY"); $("bsell").onclick = () => order("SELL");
+let armT; $("reset").onclick = async () => {
+  const b = $("reset");
+  if (!b.classList.contains("arm")) { b.classList.add("arm"); b.textContent = "再点一次确认清空"; armT = setTimeout(() => { b.classList.remove("arm"); b.textContent = "重置账户"; }, 3000); return; }
+  clearTimeout(armT); b.classList.remove("arm"); b.textContent = "重置账户";
+  await fetch("/api/reset", { method: "POST" }); say("账户已重置为 ¥10,000,日志已清空", true);
+};
+/* 全部日志(分页,无需滚动) */
+let mPage = 0, mTotal = 0, mPer = 12;
+async function loadModal() {
+  const r = await (await fetch("/api/trades?offset=" + mPage * mPer + "&limit=" + mPer, { cache: "no-store" })).json();
+  mTotal = r.total; const pages = Math.max(1, Math.ceil(mTotal / mPer));
+  $("m_info").textContent = "共 " + mTotal + " 笔 · 第 " + (mPage + 1) + " / " + pages + " 页";
+  $("mtable").innerHTML = r.rows.length ? tableHTML(r.rows) : '<div class="empty">暂无成交记录</div>';
+  $("m_prev").disabled = mPage <= 0; $("m_next").disabled = mPage + 1 >= pages;
+}
+$("allog").onclick = () => { mPage = 0; $("modal").classList.add("on"); loadModal(); };
+$("m_close").onclick = () => $("modal").classList.remove("on");
+$("m_prev").onclick = () => { mPage--; loadModal(); };
+$("m_next").onclick = () => { mPage++; loadModal(); };
+$("m_csv").onclick = async () => {
+  const r = await (await fetch("/api/trades?offset=0&limit=100000", { cache: "no-store" })).json();
+  const head = "id,时间(北京),标的,方向,成交价,币种,汇率,数量,成交额CNY,手续费CNY,盈亏CNY,盈亏%,来源,行情源,备注";
+  const rows = r.rows.slice().reverse().map((t) => [t.id, fmtDT(t.ts), t.symbol, t.side, t.price, t.currency, t.fx, t.qty, t.amountCny, t.feeCny, t.pnlCny == null ? "" : t.pnlCny, t.pnlPct == null ? "" : (t.pnlPct * 100).toFixed(3), t.source, t.feed, '"' + (t.note || "") + '"'].join(","));
+  const blob = new Blob(["\ufeff" + head + "\n" + rows.join("\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "trades.csv"; a.click();
+};
+/* AI 面板逻辑 */
+/* ---------------- AI 推理决策面板 ---------------- */
+const AI = { st: null };
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const ACT = { BUY: "买入", SELL: "卖出", HOLD: "观望" };
+async function aiLoop() {
+  try { AI.st = await (await fetch("/api/ai/state", { cache: "no-store" })).json(); renderAI(); } catch (e) { /* 忽略 */ }
+  setTimeout(aiLoop, 2000);
+}
+function studyLine(s, name) {
+  if (!s || !s.ok) return name + ":" + esc(s && s.reason ? s.reason : "无数据");
+  const o = s.oos, l = s.live;
+  return name + " 预期 <b class='mono " + cls(l.mu_h_bp) + "'>" + (l.mu_h_bp > 0 ? "+" : "") + l.mu_h_bp.toFixed(1) + "bp</b> · 样本外IC " + o.ic.toFixed(3) + " · 命中 " + (o.hit == null ? "--" : (o.hit * 100).toFixed(1) + "%") + " · " + (s.reliable ? '<span class="dn2">有效</span>' : '<span class="warn">无优势</span>') + (s.significant ? "·显著" : "");
+}
+function renderAI() {
+  const st = AI.st, body = $("ai_body"), chip = $("ai_llm"), gp = $("ai_gpu");
+  if (!st) { body.innerHTML = '<div class="dim">连接中…</div>'; return; }
+  if (!st.available) {
+    chip.className = "chip"; chip.innerHTML = "<i></i>未启用"; gp.innerHTML = "";
+    body.innerHTML = '<div class="dim" style="line-height:1.5">' + esc(st.reason || "AI 推理仅在 Kaggle(T4×2)版运行") + "</div>";
+    return;
+  }
+  const llm = st.llm;
+  chip.className = "chip " + (llm.up ? "open" : "");
+  chip.innerHTML = "<i></i>" + (llm.up ? esc((llm.model || "LLM").replace("quant-llm", "在线")) + (llm.tps ? " · " + llm.tps + " tok/s" : "") : "大模型未就绪");
+  gp.innerHTML = (st.gpus || []).map((g) => '<div class="gpu"><span>GPU' + g.i + "</span><div class='gb'><div style='width:" + Math.min(100, g.util) + "%'></div></div><b class='mono'>" + Math.round(g.util) + "%</b><span class='dim mono'>" + (g.memUsed / 1024).toFixed(1) + "/" + (g.memTotal / 1024).toFixed(0) + "G</span></div>").join("") || '<div class="dim">未检测到 GPU</div>';
+  const lv = st.live && st.live[sel], d = st.decisions && st.decisions[sel], s = st.studies && st.studies[sel];
+  let h = "";
+  if (!llm.up) h += '<div class="warn">大模型未就绪:请先在 Kaggle 运行 Cell 0(双 T4 部署),就绪后此处自动变绿。</div>';
+  if (lv && lv.running) h += '<div class="think"><b class="acc">AI 正在推理…</b> <span class="mono dim">' + lv.tokens + " tokens</span><div class='tt'>" + esc((lv.tail || "").slice(-380)) + "</div></div>";
+  if (d) {
+    if (d.error) h += '<div class="warn">分析失败:' + esc(d.error) + "</div>";
+    else {
+      const fin = d.finalAction;
+      h += '<div class="dec"><span class="sig ' + fin + '">' + ACT[fin] + "</span> <span class='dim'>AI原判 " + ACT[d.action] + " · 置信 <b class='mono'>" + (d.confidence * 100).toFixed(0) + "%</b> · " + esc(d.strategy) + " · 持有≤" + d.horizonMin + "分 · 止损" + d.stopPct + "% 止盈" + d.targetPct + "%</span></div>";
+      h += '<div class="thesis">' + esc(d.thesis) + "</div>";
+      const bad = (d.gate.checks || []).filter((c) => !c.ok);
+      h += '<div class="gate ' + (d.gate.pass ? "pass" : "fail") + '">数学闸门 ' + (d.gate.pass ? "✔ 通过" : "✘ 拦截:" + bad.slice(0, 2).map((c) => esc(c.name)).join(" / ")) + (d.exec ? " · " + esc(d.exec) : "") + "</div>";
+      h += '<div class="dim" style="font-size:.66rem">' + fmtT(d.ts) + " · 耗时 " + d.latencyS + "s · " + d.tokens + " tokens</div>";
+    }
+  } else if (llm.up && !(lv && lv.running)) h += '<div class="dim">尚无决策,点击『立即分析』或等待自动轮询。</div>';
+  if (s) {
+    h += '<div class="stl">' + studyLine(s.intra, "日内") + "</div><div class='stl'>" + studyLine(s.daily, "日线") + "</div>";
+    if (s.gap && s.gap.expected_remaining != null) h += "<div class='stl'>隔夜联动 β=" + s.gap.beta.toFixed(2) + " (t=" + s.gap.t.toFixed(1) + ", R²=" + s.gap.r2.toFixed(2) + ") 剩余预期 <b class='mono " + cls(s.gap.expected_remaining) + "'>" + (s.gap.expected_remaining * 100).toFixed(2) + "%</b></div>";
+  }
+  const sc = st.score; if (sc && sc.n) h += '<div class="dim" style="font-size:.66rem">AI复盘 ' + sc.n + " 条 · BUY命中 " + (sc.buy_rate == null ? "--" : (sc.buy_rate * 100).toFixed(0) + "%") + " · 净 " + (sc.avg_net_bp == null ? "--" : sc.avg_net_bp.toFixed(1) + "bp") + "</div>";
+  body.innerHTML = h;
+}
+$("gauto").addEventListener("click", async (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  try { const j = await (await fetch("/api/auto", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ mode: b.dataset.m }) })).json(); if (!j.ok) say("✘ " + (j.error || "切换失败"), false); else say("自动模式:" + { off: "关闭", rule: "规则策略", ai: "AI 推理策略" }[j.mode], true); } catch (er) { say("✘ 网络错误", false); }
+});
+$("ai_run").onclick = async () => { try { const j = await (await fetch("/api/ai/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: sel }) })).json(); say(j.ok ? "已触发 " + sel + " 的 AI 推理" : "✘ " + (j.error || "失败"), !!j.ok); } catch (er) { say("✘ AI 功能不可用", false); } };
+async function openAI() {
+  $("aimodal").classList.add("on");
+  const box = $("aim_body"); box.innerHTML = '<div class="dim">加载中…</div>';
+  try {
+    const st = await (await fetch("/api/ai/state?full=1", { cache: "no-store" })).json();
+    if (!st.available) { box.innerHTML = '<div class="dim">' + esc(st.reason) + "</div>"; return; }
+    let h = "";
+    for (const c of Object.keys(st.decisions || {})) {
+      const d = st.decisions[c]; if (d.error) { h += "<h3>" + c + " · 失败:" + esc(d.error) + "</h3>"; continue; }
+      h += "<h3>" + c + " · " + ACT[d.finalAction] + " <span class='dim'>(AI原判 " + ACT[d.action] + " · 置信 " + (d.confidence * 100).toFixed(0) + "% · " + fmtDT(d.ts) + ")</span></h3>";
+      h += "<div class='thesis'>" + esc(d.thesis) + "</div>";
+      h += "<div class='dim'>关键因素:" + (d.factors || []).map((f) => esc(f.factor) + "(" + esc(f.direction) + " " + f.weight + ")").join(" · ") + "</div><div class='dim'>风险:" + (d.risks || []).map(esc).join(" · ") + "</div>";
+      h += "<table class='gt'>" + (d.gate.checks || []).map((k) => "<tr><td>" + (k.ok ? "✔" : "<span class='warn'>✘</span>") + "</td><td>" + esc(k.name) + "</td><td class='dim'>" + esc(k.detail) + "</td></tr>").join("") + "</table>";
+      h += "<details><summary>完整推理过程(" + (d.thinkChars || 0) + " 字)</summary><pre>" + esc(d.think) + "</pre></details>";
+    }
+    h += "<h3>数据源状态</h3><div class='dim mono'>" + Object.keys(st.data || {}).map((k) => k + ":" + (st.data[k].ok ? st.data[k].src + "(" + st.data[k].n + "根)" : "失败 " + esc(st.data[k].err))).join(" · ") + "</div>";
+    box.innerHTML = h || '<div class="dim">尚无决策</div>';
+  } catch (e) { box.innerHTML = '<div class="dim">读取失败</div>'; }
+}
+$("ai_more").onclick = openAI;
+$("aim_close").onclick = () => $("aimodal").classList.remove("on");
+
+setInterval(() => { $("clock").textContent = fmtT(Date.now()); }, 250);
+loop();
+aiLoop();
+</script>
+</body>
+</html>
+'''
+
+for _name, _body in (("server.py", SERVER_PY), ("ai_engine.py", AI_PY), ("quant_math.py", MATH_PY), ("index.html", INDEX_HTML)):
+    with open(os.path.join(ROOT, _name), "w", encoding="utf-8") as f:
+        f.write(_body)
+try:
+    import numpy  # AI 数学内核依赖(Kaggle 自带)
 except Exception:
-    print("尚无网址记录")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "numpy"])
+print("✔ 文件已写入", ROOT)
 
-print("\n--- server.log 末尾 ---")
+# 1) 清理旧进程(方括号写法避免 pkill 误杀自身所在的 shell)
+subprocess.run("pkill -f '[q]uant/server.py'; pkill -f '[c]loudflared tunnel'; pkill -f '[l]ocalhost.run'", shell=True)
+time.sleep(1)
+
+# 2) 启动后端(行情轮询 + 模拟交易 + 网页)
+env = dict(os.environ, PORT=str(PORT), PYTHONUNBUFFERED="1")
+server_log = open(os.path.join(ROOT, "server.log"), "w")
+server = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py")], env=env, cwd=ROOT,
+                          stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
+ok = False
+for _ in range(60):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:%d/api/health" % PORT, timeout=1).read()
+        ok = True
+        break
+    except Exception:
+        if server.poll() is not None:
+            break
+        time.sleep(0.5)
+if not ok:
+    print(open(os.path.join(ROOT, "server.log")).read())
+    raise SystemExit("✘ 后端启动失败,请把上面的日志发给我")
+print("✔ 后端已启动: http://127.0.0.1:%d" % PORT)
 try:
-    print("".join(open(os.path.join(ROOT, "server.log")).readlines()[-8:]))
+    import json as _json
+    _h = _json.load(urllib.request.urlopen("http://127.0.0.1:%d/api/health" % PORT, timeout=2))
+    print("✔ AI 数学内核已加载" if _h.get("ai") else "⚠ AI 模块未加载(缺少 numpy?),规则策略仍可用")
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8001/v1/models", timeout=2).read()
+        print("✔ 检测到大模型服务(Cell 0 已就绪),页面里可直接选『AI』模式")
+    except Exception:
+        print("ℹ 尚未检测到大模型服务:请先运行 Cell 0(双 T4 部署),再刷新页面使用『AI』模式")
 except Exception:
     pass
 
-if STOP:
-    subprocess.run("pkill -f '[q]uant/server.py'; pkill -f '[c]loudflared tunnel'; pkill -f '[l]ocalhost.run'", shell=True)
-    print("已停止")
+# 联网自检:新浪行情源
+try:
+    req = urllib.request.Request("https://hq.sinajs.cn/list=sz159502", headers={"Referer": "https://finance.sina.com.cn"})
+    urllib.request.urlopen(req, timeout=4).read()
+    print("✔ 行情源可访问(新浪)")
+except Exception as ex:
+    print("⚠ 行情源不可访问:%s  → 请确认 Settings → Internet 已开启;否则页面会显示『模拟行情』" % ex)
+
+# 3) 公网隧道:优先 cloudflared(免账号),失败则回退 localhost.run(ssh)
+def wait_url(path, pattern, tries=60):
+    for _ in range(tries):
+        time.sleep(1)
+        try:
+            m = re.search(pattern, open(path).read())
+            if m:
+                return m.group(0)
+        except Exception:
+            pass
+    return None
+
+public_url = None
+try:
+    cf = os.path.join(ROOT, "cloudflared")
+    if not os.path.exists(cf):
+        print("… 下载 cloudflared")
+        urllib.request.urlretrieve(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", cf)
+        os.chmod(cf, 0o755)
+    cf_log = os.path.join(ROOT, "cloudflared.log")
+    subprocess.Popen([cf, "tunnel", "--url", "http://127.0.0.1:%d" % PORT, "--no-autoupdate"],
+                     stdout=open(cf_log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    public_url = wait_url(cf_log, r"https://[a-z0-9-]+\.trycloudflare\.com")
+except Exception as ex:
+    print("⚠ cloudflared 不可用:", ex)
+
+if not public_url:
+    print("… 改用 localhost.run 隧道")
+    lh_log = os.path.join(ROOT, "lhr.log")
+    subprocess.Popen(["ssh", "-o", "StrictHostKeyChecking=no", "-o", "ServerAliveInterval=30",
+                      "-R", "80:127.0.0.1:%d" % PORT, "nokey@localhost.run"],
+                     stdout=open(lh_log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    public_url = wait_url(lh_log, r"https://[a-z0-9]+\.lhr\.life")
+
+if public_url:
+    with open(os.path.join(ROOT, "url.txt"), "w") as f:
+        f.write(public_url)
+    print("\n" + "=" * 60)
+    print("🚀 量化终端网址(点击打开):", public_url)
+    print("=" * 60)
+    print("提示:刚生成的网址偶尔需要 10~20 秒才生效,打不开就稍等刷新。")
+    try:
+        from IPython.display import HTML, display
+        display(HTML('<a href="%s" target="_blank" style="font-size:20px">👉 打开量化终端</a>' % public_url))
+    except Exception:
+        pass
+else:
+    print("✘ 公网隧道建立失败。后端仍在 127.0.0.1:%d 运行;请确认 Internet 已开启后重新运行本单元。" % PORT)
