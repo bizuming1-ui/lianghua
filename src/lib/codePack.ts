@@ -91,11 +91,14 @@ export async function buildCodePack(): Promise<CodePack> {
   cell1 = embed(cell1, "__AI_PY__", ai);
   cell1 = embed(cell1, "__MATH_PY__", math);
   cell1 = embed(cell1, "__INDEX_HTML__", index);
+  cell1 = embed(cell1, "__INDICATORS_PY__", (await read(base, "kaggle/indicators.py"))?.content ?? "");
+  cell1 = embed(cell1, "__REFLECT_PY__", (await read(base, "kaggle/reflect.py"))?.content ?? "");
+  cell1 = embed(cell1, "__PERSIST_PY__", (await read(base, "kaggle/persist.py"))?.content ?? "");
 
   const mk = (p: string, content: string): CodeFile => ({ path: p, content, lines: countLines(content) });
   const kaggle: CodeFile[] = [
-    mk("Cell 0 · 双 T4 部署推理大模型(vLLM 张量并行,先运行)", llm),
-    mk("Cell 1 · 一键启动终端 + AI 引擎 + 公网网址", cell1),
+    mk("Cell 0 · 双 T4 部署 Qwen3-32B 推理大模型(vLLM 张量并行,先运行)", llm),
+    mk("Cell 1 · 一键启动终端 + AI 引擎 + 自动备份 + 公网网址", cell1),
     mk("Cell 2 · 查看状态 / 双卡利用率 / 停止(可选)", status),
   ];
 
