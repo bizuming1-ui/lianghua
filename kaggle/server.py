@@ -40,6 +40,15 @@ DB_PATH = os.environ.get("QUANT_DB") or (
 )
 PORT = int(os.environ.get("PORT", "8000"))
 
+# AI 推理模块(numpy + ai_engine.py + quant_math.py);缺失时其余功能照常运行
+sys.path.insert(0, HERE)
+try:
+    import ai_engine
+except Exception as _ex:  # pragma: no cover
+    ai_engine = None
+    print("AI 模块不可用:", _ex, file=sys.stderr, flush=True)
+AI = None
+
 # ----------------------------- 配置(与 config.ts 保持一致) -----------------------------
 SYMBOLS = [
     {"code": "IBB", "name": "生物科技指数ETF-iShares Nasdaq", "short": "iShares Nasdaq Biotech", "market": "US",
@@ -51,7 +60,7 @@ SYMBOLS = [
 ]
 INITIAL_CAPITAL = 10000.0
 FEE_RATE = 0.0003
-TICK_MAX = 1800
+TICK_MAX = 7200
 POLL_S = 1.0
 DEFAULT_FX = 7.2
 MA_FAST, MA_SLOW, RSI_N, BOLL_N, BOLL_K = 30, 120, 60, 120, 2
@@ -270,7 +279,7 @@ E = {
     "epoch": int(time.time() * 1000), "ticks": {}, "quotes": {}, "signals": {},
     "fx": {"rate": DEFAULT_FX, "src": "default", "at": 0},
     "feed": {"name": "-", "ok": False, "latency": 0, "lastOkAt": 0, "error": "starting"},
-    "auto": False, "last_auto": {},
+    "auto": False, "auto_mode": 0, "last_auto": {},
 }
 DB = sqlite3.connect(DB_PATH, check_same_thread=False)
 DB.row_factory = sqlite3.Row
@@ -298,7 +307,8 @@ def init_db():
         if not DB.execute("SELECT 1 FROM account WHERE id=1").fetchone():
             DB.execute("INSERT INTO account VALUES(1,?,?,0,?)", (INITIAL_CAPITAL, INITIAL_CAPITAL, int(time.time() * 1000)))
         DB.commit()
-        E["auto"] = bool(DB.execute("SELECT auto FROM account WHERE id=1").fetchone()[0])
+        E["auto_mode"] = int(DB.execute("SELECT auto FROM account WHERE id=1").fetchone()[0] or 0)
+        E["auto"] = E["auto_mode"] == 1
 
 
 def trade_row(r):
@@ -311,7 +321,7 @@ def fx_for(sym):
     return 1.0 if sym["currency"] == "CNY" else E["fx"]["rate"]
 
 
-def execute(code, side, qty, source):
+def execute(code, side, qty, source, extra_note=""):
     sym = next((s for s in SYMBOLS if s["code"] == code), None)
     if not sym:
         return {"ok": False, "error": "未知标的"}
@@ -328,7 +338,7 @@ def execute(code, side, qty, source):
         amount = r2(price * qty * fx)
         fee = r2(amount * FEE_RATE)
         now_ms = int(time.time() * 1000)
-        notes = []
+        notes = [extra_note] if extra_note else []
         st = market_state(sym["market"], time.time())
         if st != "open":
             notes.append("%s·按最近价成交" % STATE_LABEL[st])
@@ -479,9 +489,14 @@ def poll():
                 arr.append([sec, q["price"]])
                 if len(arr) > TICK_MAX:
                     del arr[: len(arr) - TICK_MAX]
-                E["signals"][s["code"]] = analyze([x[1] for x in arr])
-        if E["auto"]:
+                E["signals"][s["code"]] = analyze([x[1] for x in arr[-200:]])
+        if E["auto_mode"] == 1:
             run_strategy()
+    if AI:
+        try:
+            AI.on_tick()
+        except Exception as ex:
+            print("ai tick error:", ex, file=sys.stderr)
 
 
 def poll_loop():
@@ -539,7 +554,7 @@ def build_state(since):
             "fx": E["fx"], "feed": E["feed"],
             "account": {"cash": acc["cash"], "initial": acc["initial"], "equity": equity, "marketValue": mv,
                         "unrealized": mv - cost, "realized": st["realized"], "fees": st["fees"],
-                        "returnPct": (equity / acc["initial"] - 1) * 100, "auto": bool(acc["auto"]),
+                        "returnPct": (equity / acc["initial"] - 1) * 100, "auto": bool(acc["auto"]), "autoMode": {0: "off", 1: "rule", 2: "ai"}.get(int(acc["auto"] or 0), "off"),
                         "startedAt": acc["started_at"]},
             "positions": pos_out,
             "stats": {"trades": n, "buys": buys, "sells": sells, "wins": wins, "losses": sells - wins,
@@ -554,11 +569,14 @@ def list_trades(offset, limit):
         return {"total": total, "rows": [trade_row(r) for r in rows]}
 
 
-def set_auto(enabled):
+def set_auto(mode):
+    """mode: 0 关闭 / 1 规则策略 / 2 AI 推理策略"""
+    mode = int(mode)
     with LOCK:
-        DB.execute("UPDATE account SET auto=? WHERE id=1", (1 if enabled else 0,))
+        DB.execute("UPDATE account SET auto=? WHERE id=1", (mode,))
         DB.commit()
-        E["auto"] = bool(enabled)
+        E["auto_mode"] = mode
+        E["auto"] = mode == 1
 
 
 def reset_account():
@@ -569,7 +587,40 @@ def reset_account():
                    (INITIAL_CAPITAL, INITIAL_CAPITAL, int(time.time() * 1000)))
         DB.commit()
         E["auto"] = False
+        E["auto_mode"] = 0
         E["last_auto"] = {}
+        if AI:
+            AI.plans.clear()
+            AI.last_trade.clear()
+
+
+# ----------------------------- AI 宿主接口 -----------------------------
+def account_snapshot():
+    with LOCK:
+        acc = DB.execute("SELECT * FROM account WHERE id=1").fetchone()
+        poss = {r["symbol"]: {"qty": r["qty"], "cost": r["cost"]} for r in DB.execute("SELECT * FROM positions") if r["qty"] > 0}
+        mv = 0.0
+        for code, p in poss.items():
+            s = next(x for x in SYMBOLS if x["code"] == code)
+            q = E["quotes"].get(code)
+            if q:
+                mv += q["price"] * fx_for(s) * p["qty"]
+        since = int((time.time() - 86400) * 1000)
+        pnl = DB.execute("SELECT coalesce(sum(pnl),0) FROM trades WHERE source='ai' AND ts>=?", (since,)).fetchone()[0]
+        return {"cash": acc["cash"], "initial": acc["initial"], "equity": acc["cash"] + mv, "positions": poss, "ai_pnl_24h": pnl}
+
+
+def make_host():
+    def state_of(code):
+        return market_state(next(s for s in SYMBOLS if s["code"] == code)["market"], time.time())
+    return {
+        "symbols": SYMBOLS, "fee_rate": FEE_RATE,
+        "quote": lambda c: (dict(E["quotes"][c]) if c in E["quotes"] else None),
+        "ticks": lambda c, n: list(E["ticks"].get(c, [])[-n:]),
+        "account": account_snapshot,
+        "place": lambda code, side, qty, source, note="": execute(code, side, qty, source, note),
+        "market_state": state_of, "fx": fx_for, "auto_mode": lambda: E["auto_mode"],
+    }
 
 
 # ----------------------------- HTTP -----------------------------
@@ -605,7 +656,15 @@ class Handler(BaseHTTPRequestHandler):
                 lim = min(100000, max(1, int(q.get("limit", ["50"])[0] or 50)))
                 return self._json(list_trades(off, lim))
             if u.path == "/api/health":
-                return self._json({"ok": True})
+                return self._json({"ok": True, "ai": AI is not None})
+            if u.path == "/api/history":
+                if not AI:
+                    return self._json({"ok": False, "error": "AI/历史模块未加载(缺少 numpy?)"}, 503)
+                return self._json(AI.history_bars(q.get("code", [""])[0], q.get("tf", ["5m"])[0]))
+            if u.path == "/api/ai/state":
+                if not AI:
+                    return self._json({"available": False, "reason": "AI 模块未加载(缺少 numpy 或 ai_engine.py)"})
+                return self._json(AI.state(full=q.get("full", ["0"])[0] == "1"))
             return self._send(404, "not found", "text/plain; charset=utf-8")
         except Exception as ex:
             return self._json({"error": str(ex)}, 500)
@@ -630,8 +689,23 @@ class Handler(BaseHTTPRequestHandler):
                 r = execute(str(body.get("symbol", "")), side, qty, "manual")
                 return self._json(r, 200 if r["ok"] else 400)
             if u.path == "/api/auto":
-                set_auto(bool(body.get("enabled")))
-                return self._json({"ok": True, "enabled": bool(body.get("enabled"))})
+                mode = str(body.get("mode") or ("rule" if body.get("enabled") else "off")).lower()
+                if mode not in ("off", "rule", "ai"):
+                    return self._json({"ok": False, "error": "mode 必须是 off/rule/ai"}, 400)
+                if mode == "ai":
+                    if not AI:
+                        return self._json({"ok": False, "error": "AI 模块未加载"}, 400)
+                    if not ai_engine.llm_health()["up"]:
+                        return self._json({"ok": False, "error": "大模型未就绪:请先运行 Cell 0(双卡 vLLM),看到『双卡同时工作』后再开启"}, 400)
+                set_auto({"off": 0, "rule": 1, "ai": 2}[mode])
+                return self._json({"ok": True, "mode": mode, "enabled": mode != "off"})
+            if u.path == "/api/ai/run":
+                if not AI:
+                    return self._json({"ok": False, "error": "AI 模块未加载"}, 400)
+                if not ai_engine.llm_health()["up"]:
+                    return self._json({"ok": False, "error": "大模型未就绪"}, 400)
+                AI.trigger(body.get("code") or None)
+                return self._json({"ok": True})
             if u.path == "/api/reset":
                 reset_account()
                 return self._json({"ok": True})
@@ -646,7 +720,11 @@ class Server(ThreadingHTTPServer):
 
 
 def main():
+    global AI
     init_db()
+    if ai_engine:
+        AI = ai_engine.Engine(make_host())
+        AI.start()
     threading.Thread(target=poll_loop, daemon=True).start()
     httpd = Server(("0.0.0.0", PORT), Handler)
     print("量化终端已启动: http://127.0.0.1:%d  (数据库 %s)" % (PORT, DB_PATH), flush=True)
