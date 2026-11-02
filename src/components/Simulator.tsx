@@ -70,10 +70,10 @@ export default function Simulator() {
             <div className="absolute right-0 top-full z-20 mt-1 w-72 overflow-hidden rounded-xl border border-[#1b2738] bg-[#0b121b] shadow-2xl">
               <button onClick={() => copyFromPack("kaggle0")} className="block w-full px-4 py-3 text-left text-sm hover:bg-[#12202f]">
                 <b className="text-fuchsia-400">① 复制 Kaggle Cell 0 · 双 T4 大模型</b>
-                <span className="block text-xs text-slate-400">先运行:vLLM 张量并行,两张卡同时推理</span>
+                <span className="block text-xs text-slate-400">先运行:Qwen3-32B · vLLM 张量并行,两张卡同时推理</span>
               </button>
               <button onClick={() => copyFromPack("kaggle1")} className="block w-full border-t border-[#1b2738] px-4 py-3 text-left text-sm hover:bg-[#12202f]">
-                <b className="text-emerald-400">② 复制 Kaggle Cell 1 · 终端 + AI</b>
+                <b className="text-emerald-400">② 复制 Kaggle Cell 1 · 终端 + AI + 自动备份</b>
                 <span className="block text-xs text-slate-400">再运行:行情 + 模拟交易 + AI 决策 + 公网网址</span>
               </button>
               <button onClick={() => copyFromPack("github")} className="block w-full border-t border-[#1b2738] px-4 py-3 text-left text-sm hover:bg-[#12202f]">
