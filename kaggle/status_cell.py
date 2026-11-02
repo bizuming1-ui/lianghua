@@ -27,11 +27,25 @@ try:
         print("  GPU%d %s  利用率 %3d%%  显存 %d/%d MiB" % (g["i"], g["name"], g["util"], g["memUsed"], g["memTotal"]))
     for c, d in ai["decisions"].items():
         print("  AI·%-7s %-4s→%-4s 置信 %.2f  %s" % (c, d["action"], d["finalAction"], d["confidence"], d.get("thesis", "") or d.get("error", "")))
+    br = ai.get("brain") or {}
+    print("  推理占空比(近2分钟) %.0f%% · 当前任务:%s · 每次决策 %s 次自洽投票 · 已循环 %s 轮" % ((br.get("duty") or 0) * 100, br.get("task"), br.get("samples"), br.get("cycles")))
+    rf = ai.get("reflect") or {}
+    if rf:
+        print("  反思 %d 次 · 教训 %d 条 · %s" % (rf.get("count", 0), len(rf.get("lessons", [])), (rf.get("adapt") or {}).get("note", "")))
+        for l in rf.get("lessons", [])[-3:]:
+            print("    ·", l["text"])
     sc = ai["score"]
     print("  AI 决策复盘:已验证 %d 条;BUY 命中率 %s;平均净收益 %s bp" % (
         sc["n"], "--" if sc["buy_rate"] is None else "%.0f%%" % (sc["buy_rate"] * 100), "--" if sc["avg_net_bp"] is None else "%+.1f" % sc["avg_net_bp"]))
 except Exception as ex:
     print("AI 状态不可用:", ex)
+
+try:
+    pst = json.load(urllib.request.urlopen("http://127.0.0.1:%d/api/persist" % PORT, timeout=3))
+    c = pst["cloud"]
+    print("\n数据备份:本地快照", "✔" if pst["local"]["ok"] else "✘", "· 云备份", ("✔ 已启用" + ("" if c["ok"] else " (异常:%s)" % c["err"])) if c["enabled"] else "✘ 未配置 GITHUB_TOKEN(重开 Kaggle 数据会丢)", "· 启动恢复:", (pst.get("restored") or {}).get("detail") or "无")
+except Exception as ex:
+    print("备份状态不可用:", ex)
 
 try:
     print("\n网址:", open(os.path.join(ROOT, "url.txt")).read())
