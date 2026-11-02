@@ -56,7 +56,12 @@ export const SYMBOLS: SymbolDef[] = [
 ];
 
 export const INITIAL_CAPITAL = 10000; // 元
-export const FEE_RATE = 0.0003; // 单边万三(买卖各收一次)
+// 手续费规则(买入、卖出各收一次):成交金额 < 10000 元 => 固定 5 元;>= 10000 元 => 万五(与 5 元在 10000 处连续)
+export const FEE_FLAT = 5;
+export const FEE_FLAT_BELOW = 10000;
+export const FEE_RATE = 0.0005;
+export const feeFor = (amountCny: number): number =>
+  Math.abs(amountCny) < FEE_FLAT_BELOW ? FEE_FLAT : Math.round(Math.abs(amountCny) * FEE_RATE * 100) / 100;
 export const TICK_MAX = 7200; // 每个标的保留 2 小时的 1 秒采样
 export const POLL_MS = 1000; // 行情轮询周期
 export const DEFAULT_FX = 7.2; // 汇率全部失败时的兜底值(会在界面标注)
