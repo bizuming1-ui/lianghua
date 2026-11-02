@@ -57,7 +57,7 @@ export const SYMBOLS: SymbolDef[] = [
 
 export const INITIAL_CAPITAL = 10000; // 元
 export const FEE_RATE = 0.0003; // 单边万三(买卖各收一次)
-export const TICK_MAX = 1800; // 每个标的保留 30 分钟的 1 秒采样
+export const TICK_MAX = 7200; // 每个标的保留 2 小时的 1 秒采样
 export const POLL_MS = 1000; // 行情轮询周期
 export const DEFAULT_FX = 7.2; // 汇率全部失败时的兜底值(会在界面标注)
 
