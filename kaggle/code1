@@ -7,6 +7,12 @@
 # ==========================================================================
 import os, sys, re, time, subprocess, urllib.request
 
+# ★ 数据永久保存(强烈建议配置,否则 Kaggle 重开后账户/成交/AI 复盘会丢):
+#   到 https://github.com/settings/tokens 新建 classic token,只勾选 gist 权限,填在下面;
+#   或在 Kaggle Notebook 菜单 Add-ons → Secrets 添加名为 GITHUB_TOKEN 的密钥(推荐,不会泄露到代码里)。
+#   系统会自动在你的 GitHub 建一个【私有 Gist】保存备份,下次启动自动找回。
+GITHUB_TOKEN = ""
+
 ROOT = os.environ.get("QUANT_ROOT", "/kaggle/working/quant")
 PORT = int(os.environ.get("QUANT_PORT", "8000"))
 os.makedirs(ROOT, exist_ok=True)
@@ -25,7 +31,9 @@ SERVER_PY = r'''#!/usr/bin/env python3
   GET  /api/health     健康检查
 
 行情源:新浪(主) -> 腾讯(备);全部失败时才使用明确标注的"模拟行情"。
-存储:SQLite(默认 /kaggle/working/quant.db,否则当前目录)。
+存储:SQLite(默认 /kaggle/working/quant.db,否则当前目录)+ 云备份/本地快照(persist.py),重开 Kaggle 自动恢复。
+手续费:每笔(买入或卖出)成交金额 < 10000 元 => 固定 5 元;>= 10000 元 => 万五(0.05%,与 5 元在 10000 处连续)。
+额外接口:/api/fast(毫秒级报价)、/api/indicators(全部指标)、/api/backup、/api/restore、/api/persist。
 """
 import json
 import math
@@ -60,7 +68,13 @@ try:
 except Exception as _ex:  # pragma: no cover
     ai_engine = None
     print("AI 模块不可用:", _ex, file=sys.stderr, flush=True)
+try:
+    import persist as persist_mod
+except Exception as _ex:  # pragma: no cover
+    persist_mod = None
+    print("持久化模块不可用:", _ex, file=sys.stderr, flush=True)
 AI = None
+PERSIST = None
 
 # ----------------------------- 配置(与 config.ts 保持一致) -----------------------------
 SYMBOLS = [
@@ -72,9 +86,10 @@ SYMBOLS = [
      "currency": "CNY", "lot": 100, "decimals": 3, "sina": "sz159502", "tencent": "sz159502", "base": 1.62},
 ]
 INITIAL_CAPITAL = 10000.0
-FEE_RATE = 0.0003
+FEE_FLAT, FEE_FLAT_BELOW, FEE_RATE = 5.0, 10000.0, 0.0005  # <1万元固定5元;>=1万元万五
 TICK_MAX = 7200
-POLL_S = 1.0
+POLL_S = max(0.2, float(os.environ.get("QUANT_POLL_S", "0.5")))  # 上游抓取间隔(秒);失败时自动退避
+QTICK_MAX = 3000
 DEFAULT_FX = 7.2
 MA_FAST, MA_SLOW, RSI_N, BOLL_N, BOLL_K = 30, 120, 60, 120, 2
 TAKE_PROFIT, STOP_LOSS = 0.012, 0.008
@@ -292,7 +307,7 @@ E = {
     "epoch": int(time.time() * 1000), "ticks": {}, "quotes": {}, "signals": {},
     "fx": {"rate": DEFAULT_FX, "src": "default", "at": 0},
     "feed": {"name": "-", "ok": False, "latency": 0, "lastOkAt": 0, "error": "starting"},
-    "auto": False, "auto_mode": 0, "last_auto": {},
+    "auto": False, "auto_mode": 0, "last_auto": {}, "qticks": {}, "poll_gap": POLL_S,
 }
 DB = sqlite3.connect(DB_PATH, check_same_thread=False)
 DB.row_factory = sqlite3.Row
@@ -304,6 +319,17 @@ def r2(v):
 
 def r4(v):
     return math.floor(v * 10000 + 0.5) / 10000
+
+
+def fee_for(amount):
+    """单笔手续费(元):成交金额 < 10000 => 5 元;>= 10000 => 万五。买卖同规则。"""
+    amount = abs(amount)
+    return FEE_FLAT if amount < FEE_FLAT_BELOW else r2(amount * FEE_RATE)
+
+
+def dirty(urgent=False):
+    if PERSIST:
+        PERSIST.mark_dirty(urgent)
 
 
 def init_db():
@@ -349,7 +375,7 @@ def execute(code, side, qty, source, extra_note=""):
         price = q["price"]
         fx = fx_for(sym)
         amount = r2(price * qty * fx)
-        fee = r2(amount * FEE_RATE)
+        fee = fee_for(amount)
         now_ms = int(time.time() * 1000)
         notes = [extra_note] if extra_note else []
         st = market_state(sym["market"], time.time())
@@ -386,6 +412,7 @@ def execute(code, side, qty, source, extra_note=""):
             (now_ms, code, side, qty, price, sym["currency"], fx, amount, fee, pnl, pnl_pct, source, q["feed"], ";".join(notes)))
         DB.commit()
         row = DB.execute("SELECT * FROM trades WHERE id=?", (cur.lastrowid,)).fetchone()
+        dirty(True)
         return {"ok": True, "trade": trade_row(row)}
 
 
@@ -416,8 +443,11 @@ def run_strategy():
                     E["last_auto"][s["code"]] = now
                     cash += r["trade"]["amountCny"]
         elif sig["action"] == "BUY":
-            unit = q["price"] * fx * (1 + FEE_RATE) * s["lot"]
-            lots = int((cash * AUTO_CASH_FRACTION) // unit)
+            unit = q["price"] * fx * s["lot"]
+            budget = cash * AUTO_CASH_FRACTION
+            lots = int(budget // unit)
+            while lots >= 1 and lots * unit + fee_for(lots * unit) > budget:
+                lots -= 1  # 固定手续费也要放进预算
             if lots >= 1:
                 r = execute(s["code"], "BUY", lots * s["lot"], "auto")
                 if r["ok"]:
@@ -503,6 +533,13 @@ def poll():
                 if len(arr) > TICK_MAX:
                     del arr[: len(arr) - TICK_MAX]
                 E["signals"][s["code"]] = analyze([x[1] for x in arr[-200:]])
+            elif arr[-1][1] != q["price"]:
+                arr[-1][1] = q["price"]  # 同一秒内保持最新价(以最后一次为准)
+            qt = E["qticks"].setdefault(s["code"], [])
+            if not qt or qt[-1][1] != q["price"] or qt[-1][2] != q["quoteTime"]:
+                qt.append([now_ms, q["price"], q["quoteTime"]])
+                if len(qt) > QTICK_MAX:
+                    del qt[: len(qt) - QTICK_MAX]
         if E["auto_mode"] == 1:
             run_strategy()
     if AI:
@@ -513,13 +550,16 @@ def poll():
 
 
 def poll_loop():
+    gap = POLL_S
     while True:
         t = time.time()
         try:
             poll()
         except Exception as ex:  # 轮询失败不应让线程退出
             print("poll error:", ex, file=sys.stderr)
-        time.sleep(max(0.05, POLL_S - (time.time() - t)))
+        gap = POLL_S if E["feed"]["ok"] else min(3.0, gap * 1.6)  # 失败指数退避,恢复后立刻回到高频
+        E["poll_gap"] = gap
+        time.sleep(max(0.03, gap - (time.time() - t)))
 
 
 # ----------------------------- 对外查询 -----------------------------
@@ -561,10 +601,12 @@ def build_state(since):
                             "avgPrice": p["cost"] / (p["qty"] * fx), "mvCny": value, "pnlCny": value - p["cost"],
                             "pnlPct": (value - p["cost"]) / p["cost"] if p["cost"] > 0 else 0})
         equity = acc["cash"] + mv
-        ticks = {s["code"]: [t for t in E["ticks"].get(s["code"], []) if t[0] > since] for s in SYMBOLS}
+        ticks = {s["code"]: [t for t in E["ticks"].get(s["code"], []) if t[0] >= since] for s in SYMBOLS}
         return {
             "ts": now_ms, "epoch": E["epoch"], "quotes": quotes, "ticks": ticks, "signals": E["signals"],
-            "fx": E["fx"], "feed": E["feed"],
+            "fx": E["fx"], "feed": dict(E["feed"], pollMs=int(E["poll_gap"] * 1000)),
+            "fee": {"flat": FEE_FLAT, "below": FEE_FLAT_BELOW, "rate": FEE_RATE},
+            "persist": PERSIST.status() if PERSIST else None,
             "account": {"cash": acc["cash"], "initial": acc["initial"], "equity": equity, "marketValue": mv,
                         "unrealized": mv - cost, "realized": st["realized"], "fees": st["fees"],
                         "returnPct": (equity / acc["initial"] - 1) * 100, "auto": bool(acc["auto"]), "autoMode": {0: "off", 1: "rule", 2: "ai"}.get(int(acc["auto"] or 0), "off"),
@@ -573,6 +615,19 @@ def build_state(since):
             "stats": {"trades": n, "buys": buys, "sells": sells, "wins": wins, "losses": sells - wins,
                       "winRate": (wins / sells * 100) if sells > 0 else None},
             "trades": recent}
+
+
+def build_fast():
+    """轻量报价(前端 200ms 轮询):只含价格与报价时间,响应体几百字节。"""
+    now_ms = int(time.time() * 1000)
+    with LOCK:
+        out = {}
+        for s in SYMBOLS:
+            q = E["quotes"].get(s["code"])
+            if q:
+                out[s["code"]] = [q["price"], q["prevClose"], q["high"], q["low"], q["quoteTime"], q["feed"], q.get("lastOk", 0)]
+        qt = {c: v[-1][0] if v else 0 for c, v in E["qticks"].items()}
+        return {"ts": now_ms, "q": out, "lat": E["feed"].get("latency", 0), "pollMs": int(E["poll_gap"] * 1000), "qt": qt, "ok": E["feed"]["ok"]}
 
 
 def list_trades(offset, limit):
@@ -590,6 +645,7 @@ def set_auto(mode):
         DB.commit()
         E["auto_mode"] = mode
         E["auto"] = mode == 1
+    dirty(True)
 
 
 def reset_account():
@@ -603,8 +659,49 @@ def reset_account():
         E["auto_mode"] = 0
         E["last_auto"] = {}
         if AI:
-            AI.plans.clear()
-            AI.last_trade.clear()
+            AI.reset_learning()
+    dirty(True)
+
+
+# ----------------------------- 备份 / 恢复 -----------------------------
+def db_is_fresh():
+    with LOCK:
+        n = DB.execute("SELECT count(*) FROM trades").fetchone()[0]
+        acc = DB.execute("SELECT cash, initial FROM account WHERE id=1").fetchone()
+        return n == 0 and abs(acc["cash"] - acc["initial"]) < 1e-6
+
+
+def export_state():
+    with LOCK:
+        acc = dict(DB.execute("SELECT * FROM account WHERE id=1").fetchone())
+        poss = [dict(r) for r in DB.execute("SELECT * FROM positions")]
+        trs = [dict(r) for r in DB.execute("SELECT * FROM trades ORDER BY id")]
+        sql = {"account": acc, "positions": poss, "trades": trs}
+    return {"app": "lianghua", "sql": sql, "ai": AI.export_state() if AI else {}, "settings": {"auto_mode": E["auto_mode"]}}
+
+
+def import_state(p, replace_sql=True):
+    """p: export_state() 的产物。没有 sql 段(或 replace_sql=False)时只恢复 AI 部分。"""
+    sql = p.get("sql") if replace_sql else None
+    if sql and sql.get("account"):
+        with LOCK:
+            a = sql["account"]
+            DB.execute("DELETE FROM trades")
+            DB.execute("DELETE FROM positions")
+            DB.execute("DELETE FROM account")
+            DB.execute("INSERT INTO account(id,cash,initial,auto,started_at) VALUES(1,?,?,?,?)",
+                       (a["cash"], a["initial"], a.get("auto", 0), a.get("started_at", int(time.time() * 1000))))
+            for r in sql.get("positions") or []:
+                DB.execute("INSERT INTO positions(symbol,qty,cost) VALUES(?,?,?)", (r["symbol"], r["qty"], r["cost"]))
+            for t in sql.get("trades") or []:
+                DB.execute("INSERT INTO trades(id,ts,symbol,side,qty,price,currency,fx,amount,fee,pnl,pnl_pct,source,feed,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                           (t["id"], t["ts"], t["symbol"], t["side"], t["qty"], t["price"], t["currency"], t["fx"], t["amount"], t["fee"],
+                            t.get("pnl"), t.get("pnl_pct"), t.get("source", "manual"), t.get("feed", "sina"), t.get("note", "")))
+            DB.commit()
+            mode = int(a.get("auto") or 0)
+            E["auto_mode"], E["auto"] = mode, mode == 1
+    if AI and p.get("ai"):
+        AI.import_state(p["ai"])
 
 
 # ----------------------------- AI 宿主接口 -----------------------------
@@ -628,6 +725,7 @@ def make_host():
         return market_state(next(s for s in SYMBOLS if s["code"] == code)["market"], time.time())
     return {
         "symbols": SYMBOLS, "fee_rate": FEE_RATE,
+        "fee": fee_for, "dirty": dirty,
         "quote": lambda c: (dict(E["quotes"][c]) if c in E["quotes"] else None),
         "ticks": lambda c, n: list(E["ticks"].get(c, [])[-n:]),
         "account": account_snapshot,
@@ -669,7 +767,24 @@ class Handler(BaseHTTPRequestHandler):
                 lim = min(100000, max(1, int(q.get("limit", ["50"])[0] or 50)))
                 return self._json(list_trades(off, lim))
             if u.path == "/api/health":
-                return self._json({"ok": True, "ai": AI is not None})
+                return self._json({"ok": True, "ai": AI is not None, "persist": bool(PERSIST)})
+            if u.path == "/api/fast":
+                return self._json(build_fast())
+            if u.path == "/api/persist":
+                return self._json(PERSIST.status() if PERSIST else {"error": "持久化模块未加载"})
+            if u.path == "/api/backup":
+                data = json.dumps(dict(export_state(), saved_at=int(time.time() * 1000), version=2), ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Disposition", 'attachment; filename="quant_state_%s.json"' % time.strftime("%Y%m%d_%H%M%S"))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if u.path == "/api/indicators":
+                if not AI:
+                    return self._json({"ok": False, "error": "AI/指标模块未加载(缺少 numpy?)"}, 503)
+                return self._json(AI.indicators(q.get("code", [""])[0], q.get("tf", ["5m"])[0]))
             if u.path == "/api/history":
                 if not AI:
                     return self._json({"ok": False, "error": "AI/历史模块未加载(缺少 numpy?)"}, 503)
@@ -722,6 +837,14 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/reset":
                 reset_account()
                 return self._json({"ok": True})
+            if u.path == "/api/restore":
+                if not isinstance(body, dict) or not body.get("sql"):
+                    return self._json({"ok": False, "error": "不是有效的备份文件(缺少 sql 段)"}, 400)
+                import_state(body)
+                dirty(True)
+                return self._json({"ok": True, "trades": len((body.get("sql") or {}).get("trades") or [])})
+            if u.path == "/api/persist/save":
+                return self._json(dict(PERSIST.save_now(force=True), ok=True) if PERSIST else {"ok": False, "error": "持久化模块未加载"})
             return self._send(404, "not found", "text/plain; charset=utf-8")
         except Exception as ex:
             return self._json({"ok": False, "error": str(ex)}, 500)
@@ -733,10 +856,19 @@ class Server(ThreadingHTTPServer):
 
 
 def main():
-    global AI
+    global AI, PERSIST
     init_db()
     if ai_engine:
         AI = ai_engine.Engine(make_host())
+    if persist_mod:
+        PERSIST = persist_mod.Persist(os.path.dirname(DB_PATH) or HERE, export_state, import_state)
+        try:
+            print("♻ 恢复:", PERSIST.boot_restore(db_is_fresh()), flush=True)
+        except Exception as ex:
+            print("恢复出错:", ex, flush=True)
+        PERSIST.start()
+        print("☁ 云备份:", "已启用(GitHub Gist)" if PERSIST.token else "未配置 Token → 仅本会话/本地文件有效", flush=True)
+    if AI:
         AI.start()
     threading.Thread(target=poll_loop, daemon=True).start()
     httpd = Server(("0.0.0.0", PORT), Handler)
@@ -771,12 +903,15 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import quant_math as qm
+import indicators as ind
+import reflect
 
 LLM_URL = os.environ.get("QUANT_LLM_URL", "http://127.0.0.1:8001/v1")
 LLM_NAME = os.environ.get("QUANT_LLM_NAME", "quant-llm")
-AI_INTERVAL = float(os.environ.get("QUANT_AI_INTERVAL", "90"))
-AI_CLOSED_INTERVAL = 600.0
-MAX_TOKENS = int(os.environ.get("QUANT_AI_MAX_TOKENS", "3500"))
+AI_INTERVAL = float(os.environ.get("QUANT_AI_INTERVAL", "25"))   # 开市时同一标的两次分析的最短间隔(秒)
+AI_CLOSED_INTERVAL = float(os.environ.get("QUANT_AI_CLOSED_INTERVAL", "180"))
+ALWAYS = os.environ.get("QUANT_AI_ALWAYS", "1") != "0"           # 1=只要大模型在线就持续推理(让双卡一直工作)
+MAX_TOKENS = int(os.environ.get("QUANT_AI_MAX_TOKENS", "3000"))
 THINKING = os.environ.get("QUANT_AI_THINKING", "1") != "0"
 
 CN_TZ = timezone(timedelta(hours=8))
@@ -794,6 +929,15 @@ EM = {"1m": (1, 2400), "5m": (5, 3000), "15m": (15, 2000), "1d": (101, 600)}
 TTL = {"1m": 15, "5m": 45, "15m": 90, "1d": 900}
 CTX = {"SPY": ("SPY", "107.SPY"), "QQQ": ("QQQ", "105.QQQ"), "VIX": ("^VIX", None), "美债10Y收益率": ("^TNX", "171.US10Y"),
        "美元指数": ("DX-Y.NYB", None), "XLV医疗": ("XLV", "107.XLV"), "USDCNY": ("CNY=X", "133.USDCNH")}
+def samples():
+    """每次决策的独立推理次数(自洽性投票)。32B 更慢,默认 2 次;14B 默认 3 次。可用 QUANT_AI_SAMPLES 覆盖。"""
+    v = os.environ.get("QUANT_AI_SAMPLES")
+    if v:
+        return max(1, min(6, int(v)))
+    m = (llm_health().get("root") or os.environ.get("QUANT_LLM_MODEL", "")).lower()
+    return 2 if ("32b" in m or "30b" in m) else 3
+
+
 SLIP = {"US": 0.0002, "CN": 0.0005}  # 单边滑点假设(仅用于闸门的保守成本估计)
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 
@@ -865,6 +1009,31 @@ def em_bars(secid, klt, lmt):
     return out
 
 
+SINA_US = {"IBB": "ibb", "XBI": "xbi"}
+
+
+def sina_us_bars(sym, tf):
+    """新浪美股 K 线(第三数据源:Yahoo 被限流、东方财富不可达时的兜底;日线为全历史)。"""
+    base = "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var%20_k=/US_MinKService."
+    url = base + ("getDailyK?symbol=%s&type=daily" % sym if tf == "1d" else "getMinK?symbol=%s&type=%d" % (sym, {"1m": 1, "5m": 5, "15m": 15}[tf]))
+    req = urllib.request.Request(url, headers=dict(UA, Referer="https://finance.sina.com.cn"))
+    with urllib.request.urlopen(req, timeout=10) as r:
+        txt = r.read().decode("utf-8", "replace")
+    m = re.search(r"\((\[.*\])\)", txt, re.S)
+    if not m:
+        raise ValueError("sina us bars: bad payload")
+    arr = json.loads(m.group(1))
+    out = []
+    for x in arr:
+        d = x["d"]
+        if tf == "1d":
+            t = (datetime.strptime(d[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(hours=12)).timestamp() * 1000
+        else:
+            t = datetime.strptime(d, "%Y-%m-%d %H:%M:%S").replace(tzinfo=US_TZ).timestamp() * 1000
+        out.append([int(t), float(x["o"]), float(x["h"]), float(x["l"]), float(x["c"]), float(x.get("v") or 0)])
+    return out[-3000:] if tf != "1d" else out[-800:]
+
+
 class Data:
     def __init__(self):
         self.cache = {}
@@ -893,6 +1062,11 @@ class Data:
                         b, src = yahoo_bars(m["yahoo"], *YH[tf]), "yahoo"
                     except Exception as ex:
                         log("yahoo 失败,改用东方财富:", code, tf, ex)
+                if not b and code in SINA_US and tf in ("1m", "5m", "15m", "1d"):
+                    try:
+                        b, src = sina_us_bars(SINA_US[code], tf), "sina"
+                    except Exception as ex:
+                        log("新浪美股K线失败:", code, tf, ex)
                 if not b and "em" in m:
                     b, src = em_bars(m["em"], *EM[tf]), "eastmoney"
                 if not b:
@@ -1041,19 +1215,20 @@ def gpu_stats():
     return v
 
 
-_llm_cache = {"at": 0, "up": False, "model": ""}
+_llm_cache = {"at": 0, "up": False, "model": "", "root": ""}
 
 
 def llm_health():
     if time.time() - _llm_cache["at"] < 4:
         return _llm_cache
-    up, model = False, ""
+    up, model, root = False, "", ""
     try:
         j = http_json(LLM_URL + "/models", timeout=2, retries=0)
-        up, model = True, (j.get("data") or [{}])[0].get("id", "")
+        m0 = (j.get("data") or [{}])[0]
+        up, model, root = True, m0.get("id", ""), m0.get("root", "") or ""
     except Exception:
         pass
-    _llm_cache.update(at=time.time(), up=up, model=model)
+    _llm_cache.update(at=time.time(), up=up, model=model, root=root)
     return _llm_cache
 
 
@@ -1089,6 +1264,42 @@ def llm_stream(messages, max_tokens, thinking, on_text=None, timeout=900):
     return full, finish, ntok
 
 
+def llm_multi(messages, max_tokens, thinking, n, on_text=None, timeout=1800):
+    """一次请求 n 条独立推理(vLLM 的 n 参数,同批次并行,共享提示词前缀缓存;张量并行使两张卡同时计算)。"""
+    if n <= 1:
+        return [llm_stream(messages, max_tokens, thinking, on_text, timeout)]
+    body = {"model": LLM_NAME, "messages": messages, "max_tokens": max_tokens, "temperature": 0.7, "top_p": 0.92,
+            "top_k": 30, "n": n, "stream": True, "chat_template_kwargs": {"enable_thinking": bool(thinking)}}
+    req = urllib.request.Request(LLM_URL + "/chat/completions", data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"})
+    text, reas, fin, nt = [""] * n, [""] * n, [None] * n, [0] * n
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            d = line[5:].strip()
+            if d == "[DONE]":
+                break
+            j = json.loads(d)
+            for ch in j.get("choices") or []:
+                i = int(ch.get("index", 0))
+                if i >= n:
+                    continue
+                delta = ch.get("delta") or {}
+                rc = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                pc = delta.get("content") or ""
+                reas[i] += rc
+                text[i] += pc
+                if rc or pc:
+                    nt[i] += 1
+                    if i == 0 and on_text and nt[0] % 4 == 0:
+                        on_text(("<think>" + reas[0] + "</think>" if reas[0] and not text[0] else "") + text[0], sum(nt))
+                if ch.get("finish_reason"):
+                    fin[i] = ch["finish_reason"]
+    return [(("<think>" + reas[i] + "</think>" if reas[i] else "") + text[i], fin[i], nt[i]) for i in range(n)]
+
+
 SYSTEM_PROMPT = (
     "你是一名严谨的量化基金经理兼金融数学研究员,正在为一个【模拟盘】做下一步操作决策。"
     "标的:IBB、XBI(美股生物科技ETF)与159502(嘉实标普生物科技ETF,跟踪标普生物科技精选行业指数,与XBI高度同源)。\n"
@@ -1097,7 +1308,10 @@ SYSTEM_PROMPT = (
     "2) 只做多或空仓(BUY 开多 / SELL 平掉已有多仓 / HOLD 观望)。没有统计优势时必须 HOLD,宁可错过也不要凑交易。\n"
     "3) 必须先检验:样本外是否有优势(IC、命中率及其置信下界)、预期收益是否显著大于往返成本、市场状态(方差比)是否支持该类策略、"
     "宏观与大盘(VIX、美债、美元、SPY/QQQ/XLV)是否逆风、消息面是否有重大风险,再给结论。\n"
-    "4) 思考要精炼(尽量不超过 700 字),最后只输出一个 JSON 对象,不要输出其他文字。"
+    "4) 手续费是固定费用:每笔(买或卖)成交金额<¥10000 固定¥5,≥¥10000 按万五;本金只有¥10000,所以一次往返≈¥10,必须赚得比成本多得多。\n"
+    "5) 用户消息里有【历史教训】(来自你自己的真实复盘)和【自适应状态】,必须逐条核对本次是否重蹈覆辙;发现与教训冲突就 HOLD。\n"
+    "6) 指标(规则投票/学习复合分)只是证据而不是结论:样本外不可靠的指标不得作为买入理由。\n"
+    "7) 思考要精炼(尽量不超过 700 字),最后只输出一个 JSON 对象,不要输出其他文字。"
 )
 
 OUTPUT_SPEC = (
@@ -1132,19 +1346,35 @@ class Engine:
         self.tps = 0.0
         self.last_err = ""
         self.wake = threading.Event()
+        self.reflector = reflect.Reflector()
+        self.inds = {}
+        self._icache = {}
+        self._lcache = {}
+        self.brief = {"at": 0.0, "text": ""}
+        self.reflect_log = []
+        self.dlog = []
+        self.blk = threading.Lock()
+        self.active, self.busy_since, self.busy_log = 0, 0.0, []
+        self.cycles, self.task = 0, "启动中"
         self.save_path = os.path.join(os.environ.get("QUANT_SAVE_DIR", "/kaggle/working" if os.path.isdir("/kaggle/working") else "."), "ai_decisions.jsonl")
 
     # ---------- 基础 ----------
     def sym(self, code):
         return next(s for s in self.symbols if s["code"] == code)
 
-    def cost_rt(self, code):
+    def cost_rt(self, code, notional=None):
+        """往返成本(小数):2×(固定/万五手续费 ÷ 名义金额 + 滑点)。固定 ¥5 手续费对小仓位非常昂贵。"""
         m = self.sym(code)["market"]
-        return 2.0 * (self.h["fee_rate"] + SLIP[m])
+        if notional is None:
+            try:
+                notional = max(2000.0, self.h["account"]()["equity"] * 0.9)
+            except Exception:
+                notional = 9000.0
+        return 2.0 * (self.h["fee"](notional) / notional + SLIP[m])
 
     def start(self):
         threading.Thread(target=self._bg_loop, daemon=True).start()
-        threading.Thread(target=self._analysis_loop, daemon=True).start()
+        threading.Thread(target=self._brain_loop, daemon=True).start()
 
     # ---------- 后台:数据与统计检验 ----------
     def _bg_loop(self):
@@ -1152,6 +1382,11 @@ class Engine:
             try:
                 for s in self.symbols:
                     self.refresh_study(s["code"])
+                    for tf in ("5m", "1d"):
+                        try:
+                            self.inds.setdefault(s["code"], {})[tf] = self.indicators(s["code"], tf)
+                        except Exception as ex:
+                            log("indicators", s["code"], tf, ex)
                 if time.time() - self.ctx["at"] > 600:
                     self.refresh_ctx()
                 for s in self.symbols:
@@ -1347,14 +1582,25 @@ class Engine:
         L.append("【账户】权益 ¥%s | 现金 ¥%s | 本标的持仓 %s | 今日AI已实现盈亏 ¥%s | 首次试用本金 ¥%s"
                  % (f(eq, 2), f(acc["cash"], 2), ("%d(成本¥%s)" % (pos["qty"], f(pos["cost"], 2))) if pos and pos["qty"] > 0 else "无",
                     f(acc.get("ai_pnl_24h", 0), 2, True), f(acc["initial"], 0)))
-        L.append("【交易成本】手续费单边%.2fbp + 保守滑点单边%.1fbp => 往返成本 %.1fbp。只有预期净优势显著大于成本才值得交易。"
-                 % (self.h["fee_rate"] * 1e4, SLIP[market] * 1e4, self.cost_rt(code) * 1e4))
+        nom = max(2000.0, acc["equity"] * 0.9)
+        L.append("【交易成本】每笔手续费:成交金额<¥10000 固定¥5,≥¥10000 按万五。按名义金额≈¥%.0f 计:单边手续费 %.1fbp + 保守滑点 %.1fbp => 往返成本 %.1fbp。只有预期净优势显著大于成本才值得交易。"
+                 % (nom, self.h["fee"](nom) / nom * 1e4, SLIP[market] * 1e4, self.cost_rt(code, nom) * 1e4))
+        for tf, nm in (("5m", "5分钟"), ("1d", "日线")):
+            ib = (self.inds.get(code) or {}).get(tf)
+            if ib and ib.get("ok"):
+                L.append("【多指标引擎·%s】" % nm + ind.summary_text(ib["all"], ib["learned"]).replace("\n", " | "))
+        ad = self.reflector.adapt()
+        L.append("【自适应状态】%s;当前置信度门槛≥%.2f,预期优势门槛≥%.1f×成本%s" % (ad["note"], ad["min_conf"], ad["edge_mult"], "(连亏冷静期中)" if ad["paused"] else ""))
+        ls = self.reflector.lessons_text()
+        L.append("【历史教训(来自你自己的真实复盘,必须逐条核对)】\n" + (ls or "(暂无,尚无足够已结算的决策)"))
+        if self.brief.get("text"):
+            L.append("【宏观简报(你 %d 分钟前写的)】%s" % ((time.time() - self.brief["at"]) / 60, self.brief["text"]))
         L.append(OUTPUT_SPEC)
         return "\n".join(L)
 
     # ---------- 数学闸门 ----------
-    def gate(self, code, d, price):
-        """返回 (通过?, 检查列表, 仓位信息)。"""
+    def gate(self, code, d, price, p_start, votes=None):
+        """返回 (通过?, 检查列表, 仓位信息)。所有检查由代码执行,大模型无法越过。"""
         checks = []
 
         def chk(name, ok, detail):
@@ -1362,18 +1608,28 @@ class Engine:
             return ok
         s = self.sym(code)
         st = self.studies.get(code) or {}
-        cost_bp = self.cost_rt(code) * 1e4
         acc = self.h["account"]()
         q = self.h["quote"](code)
         si = session_info(s["market"])
         strat = d.get("strategy", "none")
+        ad = self.reflector.adapt()
+        conf_cal, ncal = self.reflector.calibrate(d["confidence"])
         chk("AI 方向", d["action"] == "BUY", "AI 建议 %s(策略 %s)" % (d["action"], strat))
-        chk("AI 置信度≥0.60", d["confidence"] >= 0.60, "置信度 %.2f" % d["confidence"])
+        if votes:
+            chk("多次采样投票一致", votes.get("agree", False), "投票 %s(共 %d 次独立推理,BUY 需≥%d 票且无分歧否决)" % (votes.get("tally"), votes.get("n", 1), votes.get("need", 1)))
+        chk("置信度≥%.2f(自适应)" % ad["min_conf"], conf_cal >= ad["min_conf"],
+            "自称 %.2f → 复盘校准 %.2f(同档历史样本 %d)。%s" % (d["confidence"], conf_cal, ncal, ad["note"]))
+        chk("非冷静期", not ad["paused"], "连亏冷静期剩 %d 秒" % ad["pause_left_s"] if ad["paused"] else "正常")
         chk("行情为真实源", bool(q) and q["feed"] in ("sina", "tencent"), "报价源 %s" % (q["feed"] if q else "无"))
         chk("处于连续竞价", si is not None, "非交易时段" if si is None else "已开盘%d分/距收盘%d分" % si)
         if si is not None:
             edge_min = 8 if strat == "swing" else 10
             chk("避开开收盘 %d 分钟" % edge_min, si[0] >= edge_min and (si[1] >= edge_min or strat == "swing"), "开盘后%d分/距收盘%d分" % si)
+        stop = clamp(d.get("stop_pct"), 0.15, 4.0, 0.6) / 100.0
+        target = clamp(d.get("target_pct"), 0.0, 10.0, 1.0) / 100.0
+        if p_start and price:
+            drift = abs(price / p_start - 1)
+            chk("决策期间价格未漂移", drift <= max(0.0025, 0.4 * stop), "推理开始 %s → 现在 %s,漂移 %.2f%%(推理耗时越长,越要确认价格没跑)" % (f(p_start, 3), f(price, 3), drift * 100))
         # 选择与策略匹配的统计优势
         cands = []
         if strat == "intraday":
@@ -1394,20 +1650,38 @@ class Engine:
                 best = ("隔夜联动模型", mu, g["p_up"], g["resid_sd"] * 1e4)
         if not chk("样本外统计优势", best is not None, ("采用 %s" % best[0]) if best else "策略对应的模型样本外无可靠优势(IC≤0 或 命中率<50%),或策略为 none"):
             best = ("无", 0.0, 0.5, 0.0)
-        chk("预期净优势≥1.5×成本", best[1] >= 1.5 * cost_bp, "预期 %+.1fbp vs 往返成本 %.1fbp×1.5=%.1fbp" % (best[1], cost_bp, 1.5 * cost_bp))
+        # 多指标共识:学习复合分(样本外可靠才参与)+ 规则投票不极端看空
+        ik = "1d" if strat == "swing" else "5m"
+        ib = (self.inds.get(code) or {}).get(ik) or {}
+        cp = ((ib.get("learned") or {}).get("composite"))
+        if cp and cp.get("reliable"):
+            chk("学习复合分不反对", cp["now"] >= 0, "复合分 %+.2f(样本外IC %+.3f)" % (cp["now"], cp["oos_ic"]))
+        else:
+            chk("学习复合分不反对", True, "复合分样本外不可靠/不可用,本项不参与(不因它放行也不因它否决)")
+        vt = (ib.get("all") or {}).get("vote")
+        if vt:
+            chk("规则指标投票不极端看空", vt["net"] > -0.45 * vt["total"], "看多%d/看空%d/共%d" % (vt["bull"], vt["bear"], vt["total"]))
+        # 仓位:固定手续费使"小仓位"不划算 → 用单笔风险预算决定(通常接近满仓),且凯利期望必须为正
+        p_eff = 0.5 + (best[2] - 0.5) * 0.7  # 向 0.5 收缩 30%,抵御估计误差
+        kel = qm.kelly_fraction(p_eff, target / stop) if stop > 0 and target > 0 else 0.0
+        frac = min(0.95, 0.015 / stop) if (kel > 0 and stop > 0) else 0.0
+        fx = self.h["fx"](s)
+        unit = (price or 0) * fx * s["lot"]
+        notional = min(acc["equity"] * frac, acc["cash"] * 0.98)
+        chk("资金≥一手", unit > 0 and notional >= unit, "可用名义 ¥%.2f vs 一手 ¥%.2f" % (notional, unit))
+        cost_bp = self.cost_rt(code, max(notional, unit, 1.0)) * 1e4
+        chk("预期净优势≥%.1f×成本" % ad["edge_mult"], best[1] >= ad["edge_mult"] * cost_bp,
+            "预期 %+.1fbp vs 往返成本 %.1fbp(固定手续费¥5×2÷名义¥%.0f + 滑点)×%.1f=%.1fbp" % (best[1], cost_bp, max(notional, unit), ad["edge_mult"], ad["edge_mult"] * cost_bp))
         chk("模型上涨概率≥52%", best[2] >= 0.52, "%.1f%%" % (best[2] * 100))
         chk("今日AI亏损未超3%本金", acc.get("ai_pnl_24h", 0) > -0.03 * acc["initial"], "近24h AI 已实现 ¥%.2f" % acc.get("ai_pnl_24h", 0))
         pos = acc["positions"].get(code)
         chk("当前无持仓(不加仓)", not (pos and pos["qty"] > 0), "已持有" if pos and pos["qty"] > 0 else "空仓")
         chk("冷却≥5分钟", time.time() - self.last_trade.get(code, 0) >= 300, "距上次AI成交 %d 秒" % min(99999, time.time() - self.last_trade.get(code, 0)))
-        stop = clamp(d.get("stop_pct"), 0.15, 4.0, 0.6) / 100.0
-        target = clamp(d.get("target_pct"), 0.0, 10.0, 1.0) / 100.0
         chk("目标≥2×往返成本", target * 1e4 >= 2 * cost_bp, "目标 %.1fbp vs %.1fbp" % (target * 1e4, 2 * cost_bp))
-        p_eff = 0.5 + (best[2] - 0.5) * 0.7  # 向 0.5 收缩 30%,抵御估计误差
-        frac = qm.size_fraction(p_eff, target, stop) if all(c["ok"] for c in checks) else 0.0
-        chk("分数凯利仓位>0", frac > 0, "p_eff=%.3f, 目标/止损=%.2f, 仓位 %.1f%% 权益" % (p_eff, target / stop if stop else 0, frac * 100))
+        chk("凯利期望为正", kel > 0, "p_eff=%.3f, 目标/止损=%.2f, 凯利 %.3f, 风险预算仓位 %.0f%% 权益(名义 ¥%.0f)" % (p_eff, target / stop if stop else 0, kel, frac * 100, notional))
         ok = all(c["ok"] for c in checks)
-        return ok, checks, {"stop": stop, "target": target, "frac": frac, "edge_bp": best[1], "p_model": best[2], "model": best[0]}
+        return ok, checks, {"stop": stop, "target": target, "frac": frac, "edge_bp": best[1], "p_model": best[2], "model": best[0],
+                            "cost_bp": cost_bp, "notional": notional, "conf_cal": conf_cal}
 
     # ---------- 分析与执行 ----------
     def trigger(self, code=None):
@@ -1423,55 +1697,149 @@ class Engine:
         open_ = self.h["market_state"](code) == "open"
         return time.time() - last >= (AI_INTERVAL if open_ else AI_CLOSED_INTERVAL)
 
-    def _analysis_loop(self):
+    def _busy(self, delta):
+        with self.blk:
+            now = time.time()
+            if self.active == 0 and delta > 0:
+                self.busy_since = now
+            self.active = max(0, self.active + delta)
+            if self.active == 0 and self.busy_since:
+                self.busy_log.append((self.busy_since, now))
+                self.busy_since = 0.0
+            while self.busy_log and self.busy_log[0][1] < now - 600:
+                self.busy_log.pop(0)
+
+    def duty(self, window=120.0):
+        """最近 window 秒里,至少有一个推理请求在跑的时间占比(= 双卡处于计算状态的占比)。"""
+        with self.blk:
+            now = time.time()
+            lo = now - window
+            tot = sum(max(0.0, b - max(a, lo)) for a, b in self.busy_log if b > lo)
+            if self.active and self.busy_since:
+                tot += now - max(self.busy_since, lo)
+            return min(1.0, tot / window)
+
+    def _brain_loop(self):
+        """大脑循环:只要大模型在线就一直有活干 —— 到期标的分析 > 复盘反思 > 宏观简报 > 对最久未分析的标的深度再分析。"""
         while True:
             try:
-                want = self.h["auto_mode"]() == 2 or time.time() - self.last_view < 90 or self.force
-                if want and llm_health()["up"]:
-                    codes = [s["code"] for s in self.symbols if self._due(s["code"])]
+                if not llm_health()["up"]:
+                    self.task = "等待大模型就绪(Cell 0)"
+                    time.sleep(3)
+                    continue
+                want = ALWAYS or self.h["auto_mode"]() == 2 or time.time() - self.last_view < 90 or self.force
+                if not want:
+                    self.task = "空闲(AI_ALWAYS=0 且无人查看)"
+                    self.wake.wait(5)
+                    self.wake.clear()
+                    continue
+                codes = [s["code"] for s in self.symbols if self._due(s["code"])]
+                codes.sort(key=lambda c: (c not in self.force, self.h["market_state"](c) != "open", self.decisions.get(c, {}).get("ts", 0)))
+                if codes:
+                    self.task = "分析 " + "/".join(codes)
                     ths = [threading.Thread(target=self.analyze, args=(c,), daemon=True) for c in codes]
                     for t in ths:
                         t.start()
                     for t in ths:
                         t.join()
+                elif self.reflector.need_reflection():
+                    self.task = "复盘反思"
+                    self.run_reflection()
+                elif time.time() - self.brief["at"] > 600:
+                    self.task = "撰写宏观简报"
+                    self.run_brief()
+                else:
+                    c = min(self.symbols, key=lambda s: (self.h["market_state"](s["code"]) != "open", self.decisions.get(s["code"], {}).get("ts", 0)))["code"]
+                    self.task = "持续推理 " + c
+                    self.analyze(c)
+                self.cycles += 1
             except Exception as ex:
                 self.last_err = "loop: %s" % ex
                 log("loop error", ex)
-            self.wake.wait(5)
-            self.wake.clear()
+                time.sleep(2)
+
+    def norm_dec(self, d):
+        action = str(d.get("action", "HOLD")).upper()
+        if action not in ("BUY", "SELL", "HOLD"):
+            action = "HOLD"
+        return {"action": action, "strategy": str(d.get("strategy", "none")).lower(),
+                "confidence": clamp(d.get("confidence"), 0, 1, 0.0), "horizon_min": int(clamp(d.get("horizon_min"), 5, 1440, 30)),
+                "stop_pct": clamp(d.get("stop_pct"), 0.15, 4, 0.6), "target_pct": clamp(d.get("target_pct"), 0, 10, 1.0),
+                "thesis": str(d.get("thesis", ""))[:200], "factors": (d.get("factors") or [])[:8], "risks": (d.get("risks") or [])[:4]}
+
+    def aggregate(self, ds):
+        """自洽性投票:BUY 需 ≥⌈2n/3⌉ 票;SELL(降风险)需 ≥⌈n/2⌉ 票;否则 HOLD。"""
+        n = len(ds)
+        tally = {}
+        for d in ds:
+            tally[d["action"]] = tally.get(d["action"], 0) + 1
+        need_buy, need_sell = math.ceil(2 * n / 3), math.ceil(n / 2)
+        action = "HOLD"
+        if tally.get("BUY", 0) >= need_buy and tally.get("BUY", 0) > tally.get("SELL", 0):
+            action = "BUY"
+        elif tally.get("SELL", 0) >= need_sell and tally.get("SELL", 0) > tally.get("BUY", 0):
+            action = "SELL"
+        ag = [d for d in ds if d["action"] == action] or ds
+        med = lambda k: sorted(x[k] for x in ag)[len(ag) // 2]  # noqa: E731
+        best = max(ag, key=lambda x: x["confidence"])
+        strat_cnt = {}
+        for x in ag:
+            strat_cnt[x["strategy"]] = strat_cnt.get(x["strategy"], 0) + 1
+        dec = {"action": action, "strategy": max(strat_cnt, key=strat_cnt.get), "confidence": sum(x["confidence"] for x in ag) / len(ag),
+               "horizon_min": int(med("horizon_min")), "stop_pct": med("stop_pct"), "target_pct": med("target_pct"),
+               "thesis": best["thesis"], "factors": best["factors"], "risks": best["risks"]}
+        agree = action != "HOLD" or max(tally.values()) == n
+        votes = {"tally": tally, "n": n, "need": need_buy, "agree": bool(action == "HOLD" or tally.get(action, 0) >= (need_buy if action == "BUY" else need_sell)),
+                 "samples": [{"action": d["action"], "conf": round(d["confidence"], 2)} for d in ds]}
+        del agree
+        return dec, votes
 
     def analyze(self, code):
         self.force.discard(code)
         t0 = time.time()
-        lv = {"running": True, "startedAt": int(t0 * 1000), "tail": "", "tokens": 0}
+        k = samples()
+        lv = {"running": True, "startedAt": int(t0 * 1000), "tail": "", "tokens": 0, "samples": k}
         self.live[code] = lv
         rec = {"ts": int(t0 * 1000), "code": code, "action": "HOLD", "finalAction": "HOLD", "confidence": 0.0, "error": ""}
         try:
+            q0 = self.h["quote"](code)
+            p_start = q0["price"] if q0 else 0
             prompt = self.snapshot(code)
             msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
 
             def on_text(txt, n):
                 lv["tail"] = txt[-900:]
                 lv["tokens"] = n
-            full, finish, ntok = llm_stream(msgs, MAX_TOKENS, THINKING, on_text)
-            think, ans = split_think(full)
-            d = extract_json(ans) if ans else None
-            truncated = d is None
-            if d is None:  # 推理被截断或格式错误:关闭思考模式快速重答一次
-                full2, _, n2 = llm_stream(msgs + [{"role": "user", "content": "请直接输出最终 JSON(不要再思考)。"}], 700, False)
-                d = extract_json(split_think(full2)[1] or full2)
-                ntok += n2
-            if d is None:
+            self._busy(1)
+            try:
+                outs = llm_multi(msgs, MAX_TOKENS, THINKING, k, on_text)
+            finally:
+                self._busy(-1)
+            decs, thinks, ntok, truncated = [], [], 0, 0
+            for full, finish, nt in outs:
+                ntok += nt
+                think, ans = split_think(full)
+                d = extract_json(ans) if ans else None
+                if d is None:  # 推理被截断或格式错误:关闭思考模式快速重答一次
+                    truncated += 1
+                    self._busy(1)
+                    try:
+                        full2, _, n2 = llm_stream(msgs + [{"role": "user", "content": "请直接输出最终 JSON(不要再思考)。"}], 700, False)
+                    finally:
+                        self._busy(-1)
+                    d = extract_json(split_think(full2)[1] or full2)
+                    ntok += n2
+                if d is not None:
+                    decs.append(self.norm_dec(d))
+                    thinks.append(think)
+            if not decs:
                 raise ValueError("模型未返回有效 JSON")
-            action = str(d.get("action", "HOLD")).upper()
-            if action not in ("BUY", "SELL", "HOLD"):
-                action = "HOLD"
-            dec = {"action": action, "strategy": str(d.get("strategy", "none")).lower(),
-                   "confidence": clamp(d.get("confidence"), 0, 1, 0.0), "horizon_min": int(clamp(d.get("horizon_min"), 5, 1440, 30)),
-                   "stop_pct": clamp(d.get("stop_pct"), 0.15, 4, 0.6), "target_pct": clamp(d.get("target_pct"), 0, 10, 1.0)}
+            dec, votes = self.aggregate(decs)
+            action = dec["action"]
+            think = thinks[0] if thinks else ""
             q = self.h["quote"](code)
             price = q["price"] if q else 0
-            ok, checks, info = self.gate(code, dec, price)
+            ok, checks, info = self.gate(code, dec, price, p_start, votes)
             acc = self.h["account"]()
             pos = acc["positions"].get(code)
             final, exec_note = "HOLD", ""
@@ -1482,27 +1850,29 @@ class Engine:
                 final = "SELL"
             rec.update({
                 "action": action, "finalAction": final, "strategy": dec["strategy"], "confidence": dec["confidence"],
+                "confCal": info.get("conf_cal"), "votes": votes,
                 "horizonMin": dec["horizon_min"], "stopPct": dec["stop_pct"], "targetPct": dec["target_pct"],
-                "thesis": str(d.get("thesis", ""))[:200], "factors": (d.get("factors") or [])[:8], "risks": (d.get("risks") or [])[:4],
+                "thesis": dec["thesis"], "factors": dec["factors"], "risks": dec["risks"],
                 "gate": {"pass": ok, "checks": checks, "info": info}, "price": price, "think": think, "thinkChars": len(think),
-                "latencyS": round(time.time() - t0, 1), "tokens": ntok, "truncated": truncated, "mode": mode,
+                "latencyS": round(time.time() - t0, 1), "tokens": ntok, "truncated": truncated > 0, "mode": mode,
             })
-            dt = max(time.time() - t0, 1e-6)
-            self.tps = ntok / dt
+            self.tps = ntok / max(time.time() - t0, 1e-6)
             if final == "BUY" and mode == 2:
                 exec_note = self.execute_buy(code, dec, info, price)
             elif final == "SELL" and mode == 2:
                 r = self.h["place"](code, "SELL", pos["qty"], "ai", "AI 平仓: " + rec["thesis"][:40])
                 exec_note = "已平仓" if r.get("ok") else "平仓失败:%s" % r.get("error")
                 if r.get("ok"):
-                    self.plans.pop(code, None)
+                    self.note_close(code, "AI 主动平仓", r["trade"], self.plans.pop(code, None))
                     self.last_trade[code] = time.time()
             elif final != "HOLD":
                 exec_note = "AI 模式未开启:仅给出建议,未下单"
             rec["exec"] = exec_note
             if action in ("BUY", "SELL") and price > 0:
-                self.pending.append({"ts": time.time(), "code": code, "action": action, "p0": price, "h": dec["horizon_min"] * 60,
-                                     "cost": self.cost_rt(code)})
+                cost = (info["cost_bp"] / 1e4) if action == "BUY" and info.get("cost_bp") else self.cost_rt(code)
+                self.pending.append({"ts": time.time(), "code": code, "action": action, "p0": price, "h": dec["horizon_min"] * 60, "cost": cost,
+                                     "hi": price, "lo": price, "conf": dec["confidence"], "strategy": dec["strategy"], "horizon_min": dec["horizon_min"],
+                                     "thesis": dec["thesis"], "factors": dec["factors"][:4], "edge_bp": info.get("edge_bp"), "model": info.get("model", "")})
         except Exception as ex:
             rec["error"] = str(ex)[:200]
             self.last_err = "analyze %s: %s" % (code, ex)
@@ -1511,29 +1881,104 @@ class Engine:
             lv["running"] = False
             with self.lock:
                 self.decisions[code] = rec
-                self.history.insert(0, {k: rec.get(k) for k in ("ts", "code", "action", "finalAction", "confidence", "thesis", "exec", "error", "price")})
+                self.history.insert(0, {k_: rec.get(k_) for k_ in ("ts", "code", "action", "finalAction", "confidence", "thesis", "exec", "error", "price")})
                 del self.history[60:]
+                self.dlog.append({k_: v for k_, v in rec.items() if k_ != "think"})
+                del self.dlog[:-300]
             try:
                 with open(self.save_path, "a", encoding="utf-8") as fp:
-                    fp.write(json.dumps({k: v for k, v in rec.items() if k != "think"}, ensure_ascii=False) + "\n")
+                    fp.write(json.dumps({k_: v for k_, v in rec.items() if k_ != "think"}, ensure_ascii=False) + "\n")
             except Exception:
                 pass
+            self.h["dirty"]()
+
+    # ---------- 反思 / 简报(空闲算力的有价值用法)----------
+    def run_reflection(self):
+        lv = {"running": True, "startedAt": int(time.time() * 1000), "tail": "", "tokens": 0, "samples": 1}
+        self.live["_reflect"] = lv
+        try:
+            msgs = [{"role": "system", "content": "你是严谨、诚实、不护短的量化复盘官。只依据给出的真实结果下结论,发现自己的错误要直说。"},
+                    {"role": "user", "content": self.reflector.reflection_prompt()}]
+
+            def on_text(txt, n):
+                lv["tail"] = txt[-900:]
+                lv["tokens"] = n
+            self._busy(1)
+            try:
+                full, _, n = llm_stream(msgs, 2200, THINKING, on_text)
+            finally:
+                self._busy(-1)
+            d = extract_json(split_think(full)[1] or "")
+            if d is None:
+                self._busy(1)
+                try:
+                    full2, _, _ = llm_stream(msgs + [{"role": "user", "content": "请直接输出最终 JSON(不要再思考)。"}], 600, False)
+                finally:
+                    self._busy(-1)
+                d = extract_json(split_think(full2)[1] or full2)
+            added = self.reflector.apply_reflection(d) if d else 0
+            self.reflect_log.insert(0, {"ts": int(time.time() * 1000), "verdict": (d or {}).get("verdict", "解析失败"), "added": added,
+                                        "mistakes": ((d or {}).get("mistakes") or [])[:4]})
+            del self.reflect_log[20:]
+        except Exception as ex:
+            self.last_err = "reflect: %s" % ex
+            self.reflector.last_reflect_at = time.time()
+        finally:
+            lv["running"] = False
+            self.h["dirty"]()
+
+    def run_brief(self):
+        self.brief["at"] = time.time()
+        try:
+            cv = self.ctx["v"]
+            if not cv:
+                return
+            txt = "; ".join("%s %s(1日%s%%,5日%s%%,20日%s%%,60日z=%s)" % (k, f(v["last"], 2), f(v["r1"] * 100, 2, True), f(v["r5"] * 100, 2, True), f(v["r20"] * 100, 2, True), f(v["z60"], 1, True)) for k, v in cv.items())
+            nw = (self.news.get("XBI", {}).get("v") or []) + (self.news.get("IBB", {}).get("v") or [])
+            titles = " | ".join(n["title"] for n in sorted(nw, key=lambda x: -x["ts"])[:6]) or "无"
+            msgs = [{"role": "system", "content": "你是宏观策略分析师。只使用给出的数据,不编造。"},
+                    {"role": "user", "content": "【宏观与大盘·日线】%s\n【新闻标题】%s\n请用不超过150字的中文,概括对美股生物科技ETF(XBI/IBB)与159502 未来1-3天的整体风险偏好判断(偏多/中性/偏空)及最关键的2个理由。" % (txt, titles)}]
+            self._busy(1)
+            try:
+                full, _, _ = llm_stream(msgs, 500, False)
+            finally:
+                self._busy(-1)
+            self.brief = {"at": time.time(), "text": split_think(full)[1].strip() or full.strip()}
+        except Exception as ex:
+            self.last_err = "brief: %s" % ex
+        finally:
+            self.h["dirty"]()
+
+    def note_close(self, code, why, trade, plan):
+        """AI 平仓后记入反思账本。"""
+        try:
+            pnl = trade.get("pnlCny")
+            if pnl is None:
+                return
+            plan = plan or {}
+            self.reflector.record_close({"ts": time.time(), "code": code, "why": why, "pnl": pnl, "pnl_pct": trade.get("pnlPct") or 0.0,
+                                         "hold_s": int(time.time() - plan.get("entry", time.time())), "thesis": plan.get("thesis", "")})
+        except Exception as ex:
+            log("note_close", ex)
 
     def execute_buy(self, code, dec, info, price):
         s = self.sym(code)
         acc = self.h["account"]()
         fx = self.h["fx"](s)
-        unit = price * fx * (1 + self.h["fee_rate"]) * s["lot"]
+        unit = price * fx * s["lot"]
         budget = min(acc["equity"] * info["frac"], acc["cash"])
         lots = int(budget // unit)
+        while lots >= 1 and lots * unit + self.h["fee"](lots * unit) > acc["cash"] + 1e-9:
+            lots -= 1  # 固定手续费也要从现金里扣
         if lots < 1:
-            return "资金不足一手(预算 ¥%.2f < 单手 ¥%.2f)" % (budget, unit)
+            return "资金不足一手(预算 ¥%.2f,单手 ¥%.2f,另需手续费)" % (budget, unit)
         r = self.h["place"](code, "BUY", lots * s["lot"], "ai", "AI买入[%s] %s" % (dec["strategy"], info["model"]))
         if not r.get("ok"):
             return "下单失败:%s" % r.get("error")
         swing = dec["strategy"] == "swing"
         self.plans[code] = {"stop": price * (1 - info["stop"]), "target": price * (1 + info["target"]),
-                            "expire": time.time() + dec["horizon_min"] * 60, "swing": swing, "entry": time.time()}
+                            "expire": time.time() + dec["horizon_min"] * 60, "swing": swing, "entry": time.time(),
+                            "thesis": dec.get("thesis", "")}
         self.last_trade[code] = time.time()
         return "已买入 %d @ %s,止损 %s 止盈 %s" % (lots * s["lot"], f(price, s["decimals"]), f(self.plans[code]["stop"], s["decimals"]), f(self.plans[code]["target"], s["decimals"]))
 
@@ -1563,17 +2008,27 @@ class Engine:
                 if why:
                     r = self.h["place"](code, "SELL", pos["qty"], "ai", why)
                     if r.get("ok"):
-                        self.plans.pop(code, None)
+                        self.note_close(code, why, r["trade"], self.plans.pop(code, None))
                         self.last_trade[code] = now
         keep = []
         for p in self.pending:
+            q = self.h["quote"](p["code"])
+            if q and q["feed"] in ("sina", "tencent"):
+                p["hi"], p["lo"] = max(p.get("hi", p["p0"]), q["price"]), min(p.get("lo", p["p0"]), q["price"])
             if now - p["ts"] < p["h"]:
                 keep.append(p)
                 continue
-            q = self.h["quote"](p["code"])
             if not q:
                 continue
             ret = q["price"] / p["p0"] - 1
+            sgn = 1.0 if p["action"] == "BUY" else -1.0
+            self.reflector.record_outcome({
+                "ts": p["ts"], "code": p["code"], "action": p["action"], "conf": p.get("conf", 0.0), "strategy": p.get("strategy", ""),
+                "p0": p["p0"], "p1": q["price"], "ret": ret * sgn, "net": ret * sgn - p["cost"],
+                "mfe": (p.get("hi", p["p0"]) / p["p0"] - 1) if sgn > 0 else (1 - p.get("lo", p["p0"]) / p["p0"]),
+                "mae": (p.get("lo", p["p0"]) / p["p0"] - 1) if sgn > 0 else (1 - p.get("hi", p["p0"]) / p["p0"]) * -1,
+                "horizon_min": p.get("horizon_min", 0), "thesis": p.get("thesis", ""), "factors": p.get("factors", []),
+                "edge_bp": p.get("edge_bp"), "model": p.get("model", "")})
             with self.lock:
                 self.score["n"] += 1
                 if p["action"] == "BUY":
@@ -1612,11 +2067,19 @@ class Engine:
             studies[c] = {"intra": brief(st.get("intra")), "daily": brief(st.get("daily")), "gap": st.get("gap"),
                           "regime": st.get("regime"), "corr": st.get("corr"), "bars5": len(self.data.cache.get((c, "5m"), (0, []))[1]),
                           "bars1d": len(self.data.cache.get((c, "1d"), (0, []))[1])}
-        return {"available": True, "llm": {"up": lh["up"], "model": lh["model"], "tps": round(self.tps, 1), "name": LLM_NAME},
+        return {"available": True, "llm": {"up": lh["up"], "model": lh.get("root") or lh["model"], "tps": round(self.tps, 1), "name": LLM_NAME},
                 "gpus": gpu_stats(), "mode": {0: "off", 1: "rule", 2: "ai"}[self.h["auto_mode"]()], "interval": AI_INTERVAL,
                 "decisions": decs, "live": self.live, "history": self.history[:30], "score": sc, "studies": studies,
                 "plans": {c: {k: v for k, v in p.items()} for c, p in self.plans.items()},
                 "ctx": self.ctx["v"], "err": self.last_err, "now": int(time.time() * 1000),
+                "reflect": dict(self.reflector.state(), log=self.reflect_log[:5]), "briefing": self.brief,
+                "brain": {"duty": round(self.duty(120), 3), "duty30": round(self.duty(30), 3), "active": self.active, "samples": samples() if lh["up"] else 0,
+                          "task": self.task, "cycles": self.cycles, "always": ALWAYS},
+                "ind": {c: {tf: ({"vote": v["all"]["vote"], "price": v["all"]["price"],
+                                  "comp": ({k: v["learned"]["composite"][k] for k in ("now", "now_pctile", "oos_ic", "oos_hit", "reliable", "significant", "oos_long_net_bp")}
+                                           if (v.get("learned") or {}).get("composite") else None),
+                                  "kept": (v.get("learned") or {}).get("n_kept"), "nfeat": (v.get("learned") or {}).get("n_feat")}
+                                 if v and v.get("ok") else None) for tf, v in d.items()} for c, d in self.inds.items()},
                 "data": {("%s:%s" % k): v for k, v in self.data.meta.items() if isinstance(k, tuple) and len(k) == 2}}
 
     def history_bars(self, code, tf):
@@ -1625,6 +2088,72 @@ class Engine:
         b = self.data.bars(code, tf)
         meta = self.data.meta.get((code, tf), {})
         return {"code": code, "tf": tf, "bars": b, "src": meta.get("src"), "ok": meta.get("ok", False), "err": meta.get("err", "")}
+
+    # ---------- 指标(全部)----------
+    def _overlay(self, code, tf, b):
+        """把实时价叠加到最后一根 K 线(未收盘的那根),指标即刻反映最新价。"""
+        q = self.h["quote"](code)
+        if not q or tf == "1d" or not b or q["feed"] not in ("sina", "tencent"):
+            return b
+        last = list(b[-1])
+        if q["quoteTime"] < last[0] + TF_SEC[tf] * 1000 * 1.5:
+            px = q["price"]
+            last[2], last[3], last[4] = max(last[2], px), min(last[3], px), px
+            return b[:-1] + [last]
+        return b
+
+    def indicators(self, code, tf):
+        if code not in DATA_MAP or tf not in TF_SEC:
+            raise ValueError("bad code/tf")
+        b = self.data.bars(code, tf)
+        if len(b) < 60:
+            return {"ok": False, "code": code, "tf": tf, "error": "K 线不足(%d<60)" % len(b)}
+        b2 = self._overlay(code, tf, b)
+        key = (code, tf, len(b2), b2[-1][0], round(b2[-1][4], 4))
+        c = self._icache.get(key)
+        if not c:
+            c = ind.compute_all(b2)
+            self._icache = {k: v for k, v in self._icache.items() if k[:2] != (code, tf)}
+            self._icache[key] = c
+        H = {"1m": 10, "5m": 6, "15m": 4, "1d": 3}[tf]
+        lk = (code, tf)
+        lc = self._lcache.get(lk)
+        if not lc or lc["key"] != (len(b), b[-1][0]) or time.time() - lc["at"] > 300:
+            lc = {"key": (len(b), b[-1][0]), "at": time.time(), "v": ind.learn_weights(b, H, self.cost_rt(code))}
+            self._lcache[lk] = lc
+        meta = self.data.meta.get((code, tf), {})
+        return {"ok": bool(c.get("ok")), "code": code, "tf": tf, "all": c, "learned": lc["v"], "src": meta.get("src"), "H": H, "at": int(time.time() * 1000)}
+
+    # ---------- 持久化 ----------
+    def export_state(self):
+        with self.lock:
+            return {"decisions_log": list(self.dlog[-300:]), "history": list(self.history[:60]), "score": dict(self.score),
+                    "plans": {c: dict(p) for c, p in self.plans.items()}, "pending": [dict(p) for p in self.pending][-200:],
+                    "last_trade": dict(self.last_trade), "reflect": self.reflector.export(), "brief": dict(self.brief),
+                    "reflect_log": list(self.reflect_log[:20])}
+
+    def import_state(self, d):
+        with self.lock:
+            self.dlog = list(d.get("decisions_log") or [])[-300:]
+            for rec in self.dlog:
+                if rec.get("code"):
+                    self.decisions[rec["code"]] = rec
+            self.history = list(d.get("history") or [])[:60]
+            if d.get("score"):
+                self.score.update(d["score"])
+            self.plans = dict(d.get("plans") or {})
+            self.pending = list(d.get("pending") or [])
+            self.last_trade = dict(d.get("last_trade") or {})
+            self.brief = dict(d.get("brief") or self.brief)
+            self.reflect_log = list(d.get("reflect_log") or [])[:20]
+        self.reflector.load(d.get("reflect"))
+
+    def reset_learning(self):
+        """重置账户时:清掉持仓计划与待评估项;复盘教训与校准数据保留(那是'经验',不是账户)。"""
+        with self.lock:
+            self.plans.clear()
+            self.pending.clear()
+            self.last_trade.clear()
 '''
 
 MATH_PY = r'''"""
@@ -2101,6 +2630,11 @@ body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .
 #mbox{width:88vw;height:84vh;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:.6rem;background:#04070b;border:1px solid #1b2738;border-radius:.7rem}
 #mbox .bar2{display:flex;gap:.6rem;align-items:center}
 #mtable{flex:1;min-height:0;overflow:hidden}
+.bkchip{cursor:pointer}.bkchip.ok{color:var(--txt);border-color:#1d3a2c}.bkchip.ok i{background:var(--dn)}.bkchip.bad{color:var(--warn);border-color:#4a3a14}.bkchip.bad i{background:var(--warn)}
+.sg{display:inline-block;padding:0 .35rem;border-radius:.25rem;font-size:.72rem}.sg.p{background:rgba(255,59,78,.15);color:var(--up)}.sg.n{background:rgba(25,195,125,.15);color:var(--dn)}.sg.z{color:var(--dim)}
+body[data-cc=us] .sg.p{background:rgba(25,195,125,.15);color:var(--up)}
+.ind2{width:100%;border-collapse:collapse;margin:.2rem 0 .6rem}.ind2 td,.ind2 th{padding:.12rem .5rem;text-align:left;font-size:.78rem;border-bottom:1px solid #0f1824;height:auto}
+.ind2 th{color:var(--dim);font-weight:400}
 </style>
 </head>
 <body data-cc="cn">
@@ -2111,6 +2645,10 @@ body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .
     <div class="sp"></div>
     <div id="feed"><i style="background:#555"></i><span>连接中…</span></div>
     <div class="chip mono" id="fx">USD/CNY --</div>
+    <span class="chip bkchip" id="bk" title="点击立即备份"><i></i><span>备份</span></span>
+    <button class="btn" id="bk_exp" title="下载全部数据(账户/持仓/成交日志/AI复盘)为 JSON">导出</button>
+    <button class="btn" id="bk_imp" title="从 JSON 备份恢复(会覆盖当前账户)">导入</button>
+    <input type="file" id="bk_file" accept=".json,application/json" style="display:none">
     <button class="btn" id="cc" title="切换红涨绿跌 / 绿涨红跌">红涨绿跌</button>
     <button class="btn danger" id="reset">重置账户</button>
     <div id="clock" class="mono">--:--:--</div>
@@ -2189,7 +2727,7 @@ body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .
           <div class="grp" id="gauto" title="自动交易模式:关闭 / 规则策略(1秒指标) / AI 推理策略(数学闸门+大模型)"><button class="btn" data-m="off">关闭</button><button class="btn" data-m="rule">规则</button><button class="btn" data-m="ai">AI</button></div></div>
         <div class="gpus" id="ai_gpu"></div>
         <div id="ai_body"></div>
-        <div class="aift"><button class="btn on" id="ai_run">立即分析</button><button class="btn" id="ai_more">推理详情</button></div>
+        <div class="aift"><button class="btn on" id="ai_run">立即分析</button><button class="btn" id="ai_ind" title="全部技术指标 + 样本外 IC 自适应加权">全部指标</button><button class="btn" id="ai_more">推理详情</button></div>
       </div>
     </aside>
   </div>
@@ -2213,7 +2751,7 @@ body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .
   </footer>
 </div>
 
-<div id="aimodal"><div id="aimbox"><div class="bar2"><b style="font-size:1.1rem">AI 推理详情 · 数学闸门 · 数据源</b><div class="sp"></div><button class="btn" id="aim_close">关闭</button></div><div id="aim_body"></div></div></div>
+<div id="aimodal"><div id="aimbox"><div class="bar2"><b style="font-size:1.1rem" id="aim_title">AI 推理详情 · 数学闸门 · 数据源</b><div class="sp"></div><button class="btn" id="aim_close">关闭</button></div><div id="aim_body"></div></div></div>
 
 <div id="modal"><div id="mbox">
   <div class="bar2"><b style="font-size:1.1rem">全部成交日志</b><span class="dim mono" id="m_info"></span><div class="sp"></div>
@@ -2276,13 +2814,13 @@ function apply(s) {
   S.prevPx = prev;
   for (const c in s.ticks) {
     const arr = (S.ticks[c] = S.ticks[c] || []);
-    for (const t of s.ticks[c]) if (!arr.length || t[0] > arr[arr.length - 1][0]) arr.push(t);
+    for (const t of s.ticks[c]) { if (!arr.length || t[0] > arr[arr.length - 1][0]) arr.push(t); else if (t[0] === arr[arr.length - 1][0]) arr[arr.length - 1][1] = t[1]; }
     if (arr.length > MAXT) arr.splice(0, arr.length - MAXT);
   }
   if (s.ticks) for (const c in S.ticks) { if (!s.ticks[c]) continue; }
   if (res !== "tick" && mode === "single") loadHist(sel, res);
-  S.q = s.quotes; S.sig = s.signals; S.acct = s.account; S.pos = s.positions; S.stats = s.stats; S.trades = s.trades; S.fx = s.fx; S.feed = s.feed; S.now = s.ts;
-  renderAll();
+  S.q = s.quotes; S.sig = s.signals; S.acct = s.account; S.pos = s.positions; S.stats = s.stats; S.trades = s.trades; S.fx = s.fx; S.feed = s.feed; S.now = s.ts; S.fee = s.fee; S.persist = s.persist;
+  renderAll(); renderBackup();
 }
 
 /* ---------------- 渲染 ---------------- */
@@ -2299,7 +2837,7 @@ function renderHeader() {
   let h;
   if (anySim) h = '<i style="background:#f5b942"></i><span style="color:#f5b942">模拟行情(外网不可用,仅演示)</span>';
   else if (anyStale || !f.ok) h = '<i style="background:#f5b942"></i><span style="color:#f5b942">行情延迟 · ' + (f.error || "stale") + "</span>";
-  else h = '<i style="background:#19c37d;box-shadow:0 0 .5rem #19c37d"></i><span>实时 · ' + f.name + " · " + f.latency + "ms · 1秒刷新</span>";
+  else h = '<i style="background:#19c37d;box-shadow:0 0 .5rem #19c37d"></i><span>实时 · ' + f.name + " · " + f.latency + "ms · " + (fastOn && S.fastAt && Date.now() - S.fastAt < 1500 ? "毫秒级刷新(" + (f.pollMs || 500) + "ms 抓取/200ms 推送)" : "1秒刷新") + "</span>";
   $("feed").innerHTML = h;
   $("fx").textContent = "USD/CNY " + S.fx.rate.toFixed(4) + (S.fx.src === "default" ? " (兜底)" : "");
 }
@@ -2379,7 +2917,8 @@ function renderTrade() {
   $("t_sym").textContent = q.code; $("t_lot").textContent = "最小单位 " + q.lot;
   const qty = parseInt($("qty").value, 10) || 0;
   const amt = q.price * qty * fxOf(q);
-  $("t_est").textContent = "预计 " + money(amt * 1.0003).replace("+", "") + (q.currency === "USD" ? " (" + CUR.USD + (q.price * qty).toFixed(2) + ")" : "");
+  const fr = S.fee || { flat: 5, below: 10000, rate: 0.0005 }, fee1 = amt <= 0 ? 0 : (amt < fr.below ? fr.flat : amt * fr.rate);
+  $("t_est").textContent = "预计 " + money(amt + fee1).replace("+", "") + " (含手续费¥" + fee1.toFixed(2) + ")" + (q.currency === "USD" ? " " + CUR.USD + (q.price * qty).toFixed(2) : "");
   const p = S.pos.find((x) => x.symbol === sel);
   $("t_pos").textContent = "持仓 " + (p ? p.qty : 0);
 }
@@ -2719,6 +3258,8 @@ function renderAI() {
   gp.innerHTML = (st.gpus || []).map((g) => '<div class="gpu"><span>GPU' + g.i + "</span><div class='gb'><div style='width:" + Math.min(100, g.util) + "%'></div></div><b class='mono'>" + Math.round(g.util) + "%</b><span class='dim mono'>" + (g.memUsed / 1024).toFixed(1) + "/" + (g.memTotal / 1024).toFixed(0) + "G</span></div>").join("") || '<div class="dim">未检测到 GPU</div>';
   const lv = st.live && st.live[sel], d = st.decisions && st.decisions[sel], s = st.studies && st.studies[sel];
   let h = "";
+  const br = st.brain;
+  if (br && llm.up) h += '<div class="dim" style="font-size:.68rem">🧠 推理占空比 <b class="mono ' + (br.duty > 0.8 ? "dn2" : "warn") + '">' + (br.duty * 100).toFixed(0) + "%</b>(近2分钟,双卡TP同步) · " + esc(br.task) + " · " + br.samples + " 次自洽投票</div>";
   if (!llm.up) h += '<div class="warn">大模型未就绪:请先在 Kaggle 运行 Cell 0(双 T4 部署),就绪后此处自动变绿。</div>';
   if (lv && lv.running) h += '<div class="think"><b class="acc">AI 正在推理…</b> <span class="mono dim">' + lv.tokens + " tokens</span><div class='tt'>" + esc((lv.tail || "").slice(-380)) + "</div></div>";
   if (d) {
@@ -2727,6 +3268,7 @@ function renderAI() {
       const fin = d.finalAction;
       h += '<div class="dec"><span class="sig ' + fin + '">' + ACT[fin] + "</span> <span class='dim'>AI原判 " + ACT[d.action] + " · 置信 <b class='mono'>" + (d.confidence * 100).toFixed(0) + "%</b> · " + esc(d.strategy) + " · 持有≤" + d.horizonMin + "分 · 止损" + d.stopPct + "% 止盈" + d.targetPct + "%</span></div>";
       h += '<div class="thesis">' + esc(d.thesis) + "</div>";
+      if (d.votes) h += '<div class="stl">投票 ' + Object.entries(d.votes.tally).map(([k, v]) => ACT[k] + v).join(" / ") + (d.confCal != null ? " · 校准后置信 " + (d.confCal * 100).toFixed(0) + "%" : "") + "</div>";
       const bad = (d.gate.checks || []).filter((c) => !c.ok);
       h += '<div class="gate ' + (d.gate.pass ? "pass" : "fail") + '">数学闸门 ' + (d.gate.pass ? "✔ 通过" : "✘ 拦截:" + bad.slice(0, 2).map((c) => esc(c.name)).join(" / ")) + (d.exec ? " · " + esc(d.exec) : "") + "</div>";
       h += '<div class="dim" style="font-size:.66rem">' + fmtT(d.ts) + " · 耗时 " + d.latencyS + "s · " + d.tokens + " tokens</div>";
@@ -2737,6 +3279,10 @@ function renderAI() {
     if (s.gap && s.gap.expected_remaining != null) h += "<div class='stl'>隔夜联动 β=" + s.gap.beta.toFixed(2) + " (t=" + s.gap.t.toFixed(1) + ", R²=" + s.gap.r2.toFixed(2) + ") 剩余预期 <b class='mono " + cls(s.gap.expected_remaining) + "'>" + (s.gap.expected_remaining * 100).toFixed(2) + "%</b></div>";
   }
   const sc = st.score; if (sc && sc.n) h += '<div class="dim" style="font-size:.66rem">AI复盘 ' + sc.n + " 条 · BUY命中 " + (sc.buy_rate == null ? "--" : (sc.buy_rate * 100).toFixed(0) + "%") + " · 净 " + (sc.avg_net_bp == null ? "--" : sc.avg_net_bp.toFixed(1) + "bp") + "</div>";
+  const rf = st.reflect;
+  if (rf) { h += '<div class="stl">🔁 已反思 ' + rf.count + " 次 · 教训 " + rf.lessons.length + " 条 · " + esc(rf.adapt.note) + (rf.adapt.paused ? " · 冷静期 " + rf.adapt.pause_left_s + "s" : "") + "</div>"; if (rf.lessons.length) h += '<div class="stl" style="color:#9fb2cc">最新教训:' + esc(rf.lessons[rf.lessons.length - 1].text) + "</div>"; }
+  const ib = st.ind && st.ind[sel] && st.ind[sel]["5m"];
+  if (ib) h += '<div class="stl">5分钟指标投票 多' + ib.vote.bull + "/空" + ib.vote.bear + (ib.comp ? " · 学习复合分 " + ib.comp.now.toFixed(2) + (ib.comp.reliable ? " 样本外可靠" : " 样本外不可靠") : "") + "</div>";
   body.innerHTML = h;
 }
 $("gauto").addEventListener("click", async (e) => {
@@ -2751,6 +3297,15 @@ async function openAI() {
     const st = await (await fetch("/api/ai/state?full=1", { cache: "no-store" })).json();
     if (!st.available) { box.innerHTML = '<div class="dim">' + esc(st.reason) + "</div>"; return; }
     let h = "";
+    $("aim_title").textContent = "AI 推理详情 · 数学闸门 · 数据源"; $("aim_body").dataset.kind = "ai";
+    const rf = st.reflect;
+    if (rf) {
+      h += "<h3>🔁 反思与自我进化 <span class='dim'>(已复盘 " + rf.settled + " 个决策结果 / " + rf.closes + " 笔平仓;反思 " + rf.count + " 次)</span></h3><div class='dim'>" + esc(rf.adapt.note) + " · 当前门槛:置信度≥" + rf.adapt.min_conf + "、预期优势≥" + rf.adapt.edge_mult + "×成本</div>";
+      if (rf.verdict) h += "<div class='thesis'>最近总评:" + esc(rf.verdict) + "</div>";
+      h += "<div>" + (rf.lessons.length ? rf.lessons.map((l, i) => (i + 1) + ". " + esc(l.text)).join("<br>") : "<span class='dim'>暂无教训:需要至少 3 个已结算的决策/平仓才会触发第一次反思。</span>") + "</div>";
+      if (rf.calib && rf.calib.length) h += "<div class='dim'>置信度校准:" + rf.calib.map((c) => c.bin + " → 实际胜率 " + (c.win * 100).toFixed(0) + "%(n=" + c.n + ", 净 " + c.avg_net_bp.toFixed(0) + "bp)").join(" · ") + "</div>";
+    }
+    if (st.briefing && st.briefing.text) h += "<h3>🌐 AI 宏观简报</h3><div>" + esc(st.briefing.text) + "</div>";
     for (const c of Object.keys(st.decisions || {})) {
       const d = st.decisions[c]; if (d.error) { h += "<h3>" + c + " · 失败:" + esc(d.error) + "</h3>"; continue; }
       h += "<h3>" + c + " · " + ACT[d.finalAction] + " <span class='dim'>(AI原判 " + ACT[d.action] + " · 置信 " + (d.confidence * 100).toFixed(0) + "% · " + fmtDT(d.ts) + ")</span></h3>";
@@ -2767,14 +3322,1032 @@ $("ai_more").onclick = openAI;
 $("aim_close").onclick = () => $("aimodal").classList.remove("on");
 
 setInterval(() => { $("clock").textContent = fmtT(Date.now()); }, 250);
+
+/* ---------------- 毫秒级报价层:/api/fast 每 200ms 一次(几百字节),价格变化即刻重绘 ---------------- */
+let fastOn = true, rq = false;
+function scheduleRender() { if (rq || !S.acct) return; rq = true; requestAnimationFrame(() => { rq = false; renderCards(); renderCenter(); renderTrade(); drawMain(); }); }
+async function fastLoop() {
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/api/fast", { cache: "no-store" });
+    if (!r.ok) throw new Error("no fast");
+    const f = await r.json();
+    let changed = false;
+    S.q.forEach((q) => {
+      const a = f.q[q.code]; if (!a) return;
+      if (a[0] !== q.price || a[4] !== q.quoteTime) {
+        S.prevPx = S.prevPx || {}; S.prevPx[q.code] = q.price;
+        q.price = a[0]; q.prevClose = a[1]; q.high = a[2]; q.low = a[3]; q.quoteTime = a[4]; q.feed = a[5];
+        q.change = q.price - q.prevClose; q.pct = q.prevClose > 0 ? (q.price / q.prevClose - 1) * 100 : null;
+        const arr = S.ticks[q.code]; if (arr && arr.length) arr[arr.length - 1][1] = q.price;
+        changed = true;
+      }
+    });
+    S.fastAt = Date.now();
+    if (S.feed) { S.feed.latency = f.lat; S.feed.pollMs = f.pollMs; }
+    if (changed) scheduleRender();
+  } catch (e) { fastOn = false; return; } // Next 版没有 /api/fast:自动退回 1 秒轮询
+  setTimeout(fastLoop, Math.max(60, 200 - (performance.now() - t0)));
+}
+
+/* ---------------- 备份 / 恢复 ---------------- */
+function renderBackup() {
+  const p = S.persist, el = $("bk");
+  ["bk", "bk_exp", "bk_imp"].forEach((id) => ($(id).style.display = p ? "" : "none"));
+  if (!p) return;
+  const c = p.cloud, l = p.local, ago = (t) => (t ? Math.max(0, Math.round((Date.now() - t) / 1000)) + "秒前" : "未保存");
+  let txt, ok;
+  if (c.enabled) { ok = c.ok; txt = ok ? "☁ 云备份 " + ago(c.at) : "☁ 云备份异常"; } else { ok = false; txt = "💾 仅本会话(未配云备份)"; }
+  el.className = "chip bkchip " + (ok ? "ok" : "bad"); el.querySelector("span").textContent = txt;
+  el.title = [p.tip, c.err && "云端:" + c.err, l.ok ? "本地快照 " + ago(l.at) + "(" + (l.bytes / 1024).toFixed(0) + "KB)" : "", p.restored && p.restored.from ? "启动时已恢复自:" + p.restored.from + "(" + p.restored.detail + ")" : "", "点击立即备份"].filter(Boolean).join("\n");
+}
+$("bk").onclick = async () => { try { const j = await (await fetch("/api/persist/save", { method: "POST" })).json(); say(j.ok ? (j.changed === false ? "数据无变化,备份已是最新" : j.cloud ? "✔ 已备份到本地并上传云端" : "✔ 已备份到本地(未配置云端)") : "✘ " + (j.error || "备份失败"), !!j.ok); } catch (e) { say("✘ 备份失败", false); } };
+$("bk_exp").onclick = () => { location.href = "/api/backup"; };
+$("bk_imp").onclick = () => $("bk_file").click();
+$("bk_file").onchange = async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  if (!confirm("导入会覆盖当前账户 / 持仓 / 成交日志,确定吗?")) { e.target.value = ""; return; }
+  try { const j = await (await fetch("/api/restore", { method: "POST", headers: { "Content-Type": "application/json" }, body: await f.text() })).json(); say(j.ok ? "✔ 已恢复 " + j.trades + " 笔成交" : "✘ " + (j.error || "导入失败"), !!j.ok); } catch (er) { say("✘ 文件无效", false); }
+  e.target.value = "";
+};
+
+/* ---------------- 全部指标面板 ---------------- */
+let indTf = "5m";
+const sgl = (v) => (v > 0 ? '<span class="sg p">看多</span>' : v < 0 ? '<span class="sg n">看空</span>' : '<span class="sg z">中性</span>');
+async function openInd(tf) {
+  if (tf) indTf = tf;
+  $("aimodal").classList.add("on"); $("aim_title").textContent = "全部指标 · " + sel + " · " + indTf;
+  const box = $("aim_body"); box.dataset.kind = "ind"; box.innerHTML = '<div class="dim">计算中…</div>';
+  const tabs = '<div style="display:flex;gap:.3rem;margin-bottom:.5rem">' + ["1m", "5m", "15m", "1d"].map((t) => '<button class="btn ' + (t === indTf ? "on" : "") + '" data-t="' + t + '">' + t + "</button>").join("") + "</div>";
+  try {
+    const j = await (await fetch("/api/indicators?code=" + sel + "&tf=" + indTf, { cache: "no-store" })).json();
+    if (!j.ok) { box.innerHTML = tabs + '<div class="warn">' + esc(j.error || "指标不可用(仅 Kaggle 后端提供;或 K 线不足)") + "</div>"; return; }
+    const a = j.all, v = a.vote, L = j.learned || {};
+    let h = tabs + "<div>规则投票:多 <b class='up'>" + v.bull + "</b> / 空 <b class='dn'>" + v.bear + "</b> / 共 " + v.total + " 项 · 趋势组净 " + v.trend_net + " · 动量组净 " + v.mom_net + " · K线 " + a.n_bars + " 根 · 来源 " + esc(j.src || "?") + " · 价格 " + a.price.toFixed(3) + "</div>";
+    h += "<h3>样本外学习(只信数据:训练段显著的指标才加权,测试段验证)</h3>";
+    const cp = L.composite;
+    if (cp) h += "<div>从 " + L.n_feat + " 个指标中保留 <b>" + L.n_kept + "</b> 个(训练段 |t|≥1.5)。复合分当前 <b class='mono'>" + cp.now.toFixed(2) + "</b>(历史分位 " + (cp.now_pctile * 100).toFixed(0) + "%)· 样本外 IC <b class='mono'>" + cp.oos_ic.toFixed(3) + "</b>(t=" + cp.oos_ic_t.toFixed(2) + ")· 命中 " + (cp.oos_hit == null ? "--" : (cp.oos_hit * 100).toFixed(1) + "%") + " · 做多扣费净期望 " + cp.oos_long_net_bp.toFixed(1) + "bp(n=" + cp.oos_long_n + ") · " + (cp.reliable ? '<span class="dn2">样本外可靠</span>' : '<span class="warn">样本外不可靠:不应据此交易</span>') + "</div><div class='dim'>主要贡献:" + cp.contrib.map((x) => esc(x[0]) + (x[1] > 0 ? "+" : "") + x[1].toFixed(2)).join(" · ") + "</div>";
+    else h += '<div class="warn">' + esc(L.reason || "不可用") + "</div>";
+    if (L.table && L.table.length) h += "<table class='ind2'><tr><th>指标</th><th>训练 IC</th><th>t</th><th>测试 IC</th><th>方向</th><th>采用</th></tr>" + L.table.slice(0, 14).map((r) => "<tr class='mono'><td>" + esc(r.name) + "</td><td>" + r.ic_train.toFixed(3) + "</td><td>" + r.t_train.toFixed(2) + "</td><td>" + r.ic_test.toFixed(3) + "</td><td>" + r.dir + "</td><td>" + (r.kept ? "✔" : "—") + "</td></tr>").join("") + "</table>";
+    for (const g of ["趋势", "动量", "波动", "量价"]) {
+      h += "<h3>" + g + "指标</h3><table class='ind2'><tr><th>指标</th><th>数值</th><th>信号</th><th>说明</th></tr>" + a.rows.filter((r) => r.g === g).map((r) => "<tr><td>" + esc(r.name) + "</td><td class='mono'>" + esc(r.v) + "</td><td>" + sgl(r.sig) + "</td><td class='dim'>" + esc(r.note) + "</td></tr>").join("") + "</table>";
+    }
+    box.innerHTML = h;
+  } catch (e) { box.innerHTML = tabs + '<div class="warn">读取失败(此后端没有指标接口)</div>'; }
+}
+$("aim_body").addEventListener("click", (e) => { const b = e.target.closest("button[data-t]"); if (b) openInd(b.dataset.t); });
+$("ai_ind").onclick = () => openInd();
+
 loop();
 aiLoop();
+fastLoop();
 </script>
 </body>
 </html>
 '''
 
-for _name, _body in (("server.py", SERVER_PY), ("ai_engine.py", AI_PY), ("quant_math.py", MATH_PY), ("index.html", INDEX_HTML)):
+INDICATORS_PY = r'''"""
+全指标引擎(numpy)——全部由真实 K 线计算,没有任何编造数据。
+
+两层用法:
+  1) compute_all(bars)     最新一根 K 线上的 40+ 个指标:数值 + 方向信号(+1 看多 / -1 看空 / 0 中性) + 文字解释,
+                           并给出"教科书规则投票"。
+  2) learn_weights(bars,H) 对每个指标做"样本外"检验:训练段估计 IC(指标值与未来 H 根收益的相关),
+                           只保留训练段显著的指标,用 IC 加权合成复合分,再在测试段验证复合分的 IC / 命中率 / 扣费净期望。
+                           => 系统不是迷信某个指标,而是让数据告诉我们:这只标的当前哪些指标真的有预测力。
+
+bars: [[t_ms, open, high, low, close, volume], ...](时间升序)
+"""
+import math
+
+import numpy as np
+
+
+def _a(x):
+    return np.asarray(x, dtype=float)
+
+
+# ----------------------------- 基础序列 -----------------------------
+def ema(x, n):
+    x = _a(x)
+    out = np.empty_like(x)
+    if len(x) == 0:
+        return out
+    a = 2.0 / (n + 1.0)
+    out[0] = x[0]
+    for i in range(1, len(x)):
+        out[i] = a * x[i] + (1 - a) * out[i - 1]
+    return out
+
+
+def wilder(x, n):
+    x = _a(x)
+    out = np.empty_like(x)
+    if len(x) == 0:
+        return out
+    out[0] = x[0]
+    a = 1.0 / n
+    for i in range(1, len(x)):
+        out[i] = out[i - 1] + a * (x[i] - out[i - 1])
+    return out
+
+
+def sma(x, n):
+    x = _a(x)
+    out = np.full(len(x), np.nan)
+    if len(x) < n:
+        return out
+    cs = np.cumsum(np.insert(x, 0, 0.0))
+    out[n - 1:] = (cs[n:] - cs[:-n]) / n
+    out[:n - 1] = np.cumsum(x[:n - 1]) / np.arange(1, n)
+    return out
+
+
+def rolling_max(x, n):
+    x = _a(x)
+    return np.array([x[max(0, i - n + 1): i + 1].max() for i in range(len(x))])
+
+
+def rolling_min(x, n):
+    x = _a(x)
+    return np.array([x[max(0, i - n + 1): i + 1].min() for i in range(len(x))])
+
+
+def rolling_std(x, n):
+    x = _a(x)
+    out = np.zeros(len(x))
+    for i in range(len(x)):
+        w = x[max(0, i - n + 1): i + 1]
+        out[i] = w.std() if len(w) > 1 else 0.0
+    return out
+
+
+def true_range(h, l, c):
+    pc = np.r_[c[0], c[:-1]]
+    return np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+
+
+def _safe(a, b, default=0.0):
+    return np.where(np.abs(b) > 1e-12, a / np.where(np.abs(b) > 1e-12, b, 1.0), default)
+
+
+# ----------------------------- 指标序列(全部返回与 bars 等长的数组) -----------------------------
+def rsi_series(c, n):
+    d = np.diff(c, prepend=c[0])
+    up, dn = wilder(np.maximum(d, 0), n), wilder(np.maximum(-d, 0), n)
+    rs = _safe(up, dn, 1e9)
+    return np.where(dn < 1e-12, np.where(up < 1e-12, 50.0, 100.0), 100.0 - 100.0 / (1.0 + rs))
+
+
+def stoch_kd(h, l, c, n=9, k_s=3, d_s=3):
+    hh, ll = rolling_max(h, n), rolling_min(l, n)
+    rsv = _safe(c - ll, hh - ll, 0.5) * 100.0
+    k = np.empty_like(rsv)
+    d = np.empty_like(rsv)
+    k[0] = d[0] = 50.0
+    for i in range(1, len(rsv)):
+        k[i] = (k_s - 1) / k_s * k[i - 1] + 1.0 / k_s * rsv[i]
+        d[i] = (d_s - 1) / d_s * d[i - 1] + 1.0 / d_s * k[i]
+    return k, d, 3 * k - 2 * d, rsv
+
+
+def adx_series(h, l, c, n=14):
+    up = np.diff(h, prepend=h[0])
+    dn = -np.diff(l, prepend=l[0])
+    pdm = np.where((up > dn) & (up > 0), up, 0.0)
+    mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    atr = wilder(true_range(h, l, c), n)
+    pdi = 100 * _safe(wilder(pdm, n), atr)
+    mdi = 100 * _safe(wilder(mdm, n), atr)
+    dx = 100 * _safe(np.abs(pdi - mdi), pdi + mdi)
+    return wilder(dx, n), pdi, mdi
+
+
+def supertrend(h, l, c, n=10, mult=3.0):
+    atr = wilder(true_range(h, l, c), n)
+    hl2 = (h + l) / 2.0
+    ub, lb = hl2 + mult * atr, hl2 - mult * atr
+    fu, fl = ub.copy(), lb.copy()
+    dirn = np.ones(len(c))
+    for i in range(1, len(c)):
+        fu[i] = ub[i] if (ub[i] < fu[i - 1] or c[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = lb[i] if (lb[i] > fl[i - 1] or c[i - 1] < fl[i - 1]) else fl[i - 1]
+        if dirn[i - 1] == 1:
+            dirn[i] = -1 if c[i] < fl[i] else 1
+        else:
+            dirn[i] = 1 if c[i] > fu[i] else -1
+    return dirn, np.where(dirn > 0, fl, fu)
+
+
+def psar(h, l, af0=0.02, af_max=0.2):
+    n = len(h)
+    sar = np.empty(n)
+    trend = np.ones(n)
+    if n < 3:
+        return trend, h.copy()
+    up = h[1] >= h[0]
+    ep = h[0] if up else l[0]
+    s = l[0] if up else h[0]
+    af = af0
+    sar[0] = s
+    trend[0] = 1 if up else -1
+    for i in range(1, n):
+        s = s + af * (ep - s)
+        if up:
+            s = min(s, l[i - 1], l[i - 2] if i > 1 else l[i - 1])
+            if l[i] < s:
+                up, s, ep, af = False, ep, l[i], af0
+            elif h[i] > ep:
+                ep, af = h[i], min(af + af0, af_max)
+        else:
+            s = max(s, h[i - 1], h[i - 2] if i > 1 else h[i - 1])
+            if h[i] > s:
+                up, s, ep, af = True, ep, h[i], af0
+            elif l[i] < ep:
+                ep, af = l[i], min(af + af0, af_max)
+        sar[i] = s
+        trend[i] = 1 if up else -1
+    return trend, sar
+
+
+def aroon_osc(h, l, n=25):
+    out = np.zeros(len(h))
+    for i in range(len(h)):
+        wh, wl = h[max(0, i - n): i + 1], l[max(0, i - n): i + 1]
+        since_h = len(wh) - 1 - int(np.argmax(wh))
+        since_l = len(wl) - 1 - int(np.argmin(wl))
+        out[i] = 100.0 * (since_l - since_h) / n
+    return out
+
+
+def cci_series(h, l, c, n=20):
+    tp = (h + l + c) / 3.0
+    m = sma(tp, n)
+    md = np.array([np.abs(tp[max(0, i - n + 1): i + 1] - m[i]).mean() for i in range(len(tp))])
+    return _safe(tp - m, 0.015 * md)
+
+
+def mfi_series(h, l, c, v, n=14):
+    tp = (h + l + c) / 3.0
+    mf = tp * v
+    d = np.diff(tp, prepend=tp[0])
+    pos, neg = np.where(d > 0, mf, 0.0), np.where(d < 0, mf, 0.0)
+    out = np.full(len(c), 50.0)
+    for i in range(n, len(c)):
+        p, q = pos[i - n + 1: i + 1].sum(), neg[i - n + 1: i + 1].sum()
+        out[i] = 100.0 if q <= 0 and p > 0 else (50.0 if q <= 0 else 100.0 - 100.0 / (1.0 + p / q))
+    return out
+
+
+def obv_series(c, v):
+    d = np.sign(np.diff(c, prepend=c[0]))
+    return np.cumsum(d * v)
+
+
+def cmf_series(h, l, c, v, n=20):
+    mfm = _safe((c - l) - (h - c), h - l)
+    mfv = mfm * v
+    out = np.zeros(len(c))
+    for i in range(len(c)):
+        a = max(0, i - n + 1)
+        sv = v[a: i + 1].sum()
+        out[i] = mfv[a: i + 1].sum() / sv if sv > 0 else 0.0
+    return out
+
+
+def session_vwap(t, h, l, c, v):
+    day = np.cumsum(np.r_[0, (np.diff(t) > 4 * 3600 * 1000).astype(int)])
+    tp = (h + l + c) / 3.0
+    out = c.copy()
+    for d in np.unique(day):
+        m = day == d
+        cv, cp = np.cumsum(v[m]), np.cumsum(tp[m] * v[m])
+        out[m] = np.where(cv > 0, cp / np.where(cv > 0, cv, 1.0), c[m])
+    return out
+
+
+def linreg_t(c, n=30):
+    out = np.zeros(len(c))
+    x = np.arange(n, dtype=float)
+    xm = x.mean()
+    sxx = ((x - xm) ** 2).sum()
+    for i in range(n - 1, len(c)):
+        y = np.log(c[i - n + 1: i + 1])
+        ym = y.mean()
+        b = ((x - xm) * (y - ym)).sum() / sxx
+        res = y - (ym + b * (x - xm))
+        se = math.sqrt(max((res ** 2).sum() / (n - 2), 1e-18) / sxx)
+        out[i] = b / se if se > 0 else 0.0
+    return out
+
+
+def ichimoku(h, l):
+    tenkan = (rolling_max(h, 9) + rolling_min(l, 9)) / 2
+    kijun = (rolling_max(h, 26) + rolling_min(l, 26)) / 2
+    sa = (tenkan + kijun) / 2
+    sb = (rolling_max(h, 52) + rolling_min(l, 52)) / 2
+    return tenkan, kijun, sa, sb
+
+
+def build_series(bars):
+    """返回 (序列字典 S, 基础数组 B)。S 里的每一项都是与 bars 等长的 numpy 数组。"""
+    B = _a(bars)
+    t, o, h, l, c, v = (B[:, i] for i in range(6))
+    n = len(c)
+    S = {}
+    r1 = np.diff(np.log(c), prepend=np.log(c[0]))
+    S["ret"] = r1
+    for k in (5, 10, 20, 30, 60, 120):
+        S["ma%d" % k] = sma(c, k)
+    for k in (8, 12, 21, 26, 55, 100, 200):
+        S["ema%d" % k] = ema(c, k)
+    macd = S["ema12"] - S["ema26"]
+    sig = ema(macd, 9)
+    S["macd"], S["macd_sig"], S["macd_hist"] = macd, sig, macd - sig
+    for k in (6, 14, 24):
+        S["rsi%d" % k] = rsi_series(c, k)
+    rs14 = S["rsi14"]
+    lo_r, hi_r = rolling_min(rs14, 14), rolling_max(rs14, 14)
+    S["stochrsi"] = _safe(rs14 - lo_r, hi_r - lo_r, 0.5) * 100
+    S["k"], S["d"], S["j"], S["rsv"] = stoch_kd(h, l, c, 9)
+    hh14, ll14 = rolling_max(h, 14), rolling_min(l, 14)
+    S["willr"] = -100 * _safe(hh14 - c, hh14 - ll14, 0.5)
+    S["cci"] = cci_series(h, l, c, 20)
+    S["roc12"] = np.r_[np.zeros(12), c[12:] / c[:-12] - 1] * 100 if n > 12 else np.zeros(n)
+    S["mom10"] = np.r_[np.zeros(10), c[10:] - c[:-10]] if n > 10 else np.zeros(n)
+    S["trix"] = np.r_[0, np.diff(ema(ema(ema(c, 15), 15), 15))] / np.maximum(c, 1e-9) * 100
+    S["adx"], S["pdi"], S["mdi"] = adx_series(h, l, c, 14)
+    S["st_dir"], S["st_line"] = supertrend(h, l, c, 10, 3.0)
+    S["sar_dir"], S["sar"] = psar(h, l)
+    S["aroon"] = aroon_osc(h, l, 25)
+    S["tenkan"], S["kijun"], S["spana"], S["spanb"] = ichimoku(h, l)
+    S["atr14"] = wilder(true_range(h, l, c), 14)
+    bm, bs = sma(c, 20), rolling_std(c, 20)
+    S["bb_mid"], S["bb_up"], S["bb_lo"] = bm, bm + 2 * bs, bm - 2 * bs
+    S["bb_pctb"] = _safe(c - S["bb_lo"], S["bb_up"] - S["bb_lo"], 0.5)
+    S["bb_bw"] = _safe(S["bb_up"] - S["bb_lo"], bm)
+    em20, atr10 = ema(c, 20), wilder(true_range(h, l, c), 10)
+    S["kc_up"], S["kc_lo"] = em20 + 2 * atr10, em20 - 2 * atr10
+    S["dc_up"], S["dc_lo"] = rolling_max(h, 20), rolling_min(l, 20)
+    S["dc_pos"] = _safe(c - S["dc_lo"], S["dc_up"] - S["dc_lo"], 0.5)
+    S["zscore20"] = _safe(c - bm, bs)
+    S["linreg_t"] = linreg_t(c, 30)
+    S["mfi"] = mfi_series(h, l, c, v, 14)
+    S["obv"] = obv_series(c, v)
+    S["obv_ma"] = ema(S["obv"], 20)
+    S["cmf"] = cmf_series(h, l, c, v, 20)
+    S["vwap"] = session_vwap(t, h, l, c, v)
+    vm = sma(v, 20)
+    S["volratio"] = _safe(v, vm, 1.0)
+    S["force"] = ema(np.diff(c, prepend=c[0]) * v, 13)
+    S["rv20"] = np.sqrt(sma(r1 ** 2, 20))
+    return S, B
+
+
+# ----------------------------- 方向化特征(正=看多;符号由数据在训练段决定)-----------------------------
+def feature_dict(S, B):
+    c, v = B[:, 4], B[:, 5]
+    sg = np.maximum(S["rv20"], 1e-6)
+    F = {}
+    F["EMA8/21 趋势"] = (S["ema8"] - S["ema21"]) / c / sg
+    F["EMA21/55 趋势"] = (S["ema21"] - S["ema55"]) / c / sg
+    F["价格-EMA55"] = (c - S["ema55"]) / c / sg
+    F["MA5/20"] = (S["ma5"] - S["ma20"]) / c / sg
+    F["MACD 柱"] = S["macd_hist"] / c / sg
+    F["MACD 线"] = S["macd"] / c / sg
+    F["ADX·DI 差"] = (S["pdi"] - S["mdi"]) * S["adx"] / 100.0 / 25.0
+    F["SuperTrend"] = S["st_dir"]
+    F["抛物线 SAR"] = S["sar_dir"]
+    F["Aroon 振荡"] = S["aroon"] / 50.0
+    cloud_top, cloud_bot = np.maximum(S["spana"], S["spanb"]), np.minimum(S["spana"], S["spanb"])
+    F["一目均衡云"] = np.where(c > cloud_top, 1.0, np.where(c < cloud_bot, -1.0, 0.0)) + np.sign(S["tenkan"] - S["kijun"]) * 0.5
+    F["回归斜率 t"] = np.clip(S["linreg_t"] / 5.0, -3, 3)
+    for k in (6, 14, 24):
+        F["RSI%d" % k] = (S["rsi%d" % k] - 50.0) / 25.0
+    F["StochRSI"] = (S["stochrsi"] - 50.0) / 25.0
+    F["KDJ-J"] = (S["j"] - 50.0) / 40.0
+    F["KDJ K-D"] = (S["k"] - S["d"]) / 10.0
+    F["威廉 %R"] = (S["willr"] + 50.0) / 25.0
+    F["CCI20"] = S["cci"] / 100.0
+    F["ROC12"] = S["roc12"] / 100.0 / sg
+    F["TRIX"] = S["trix"] / 100.0 / sg
+    F["布林 %B"] = (S["bb_pctb"] - 0.5) * 2.0
+    F["布林带宽变化"] = np.r_[0, np.diff(S["bb_bw"])] / np.maximum(S["bb_bw"], 1e-9)
+    F["Keltner 位置"] = _safe(c - (S["kc_up"] + S["kc_lo"]) / 2, S["kc_up"] - S["kc_lo"])
+    F["唐奇安位置"] = (S["dc_pos"] - 0.5) * 2.0
+    F["Z-score20"] = np.clip(S["zscore20"], -4, 4) / 2.0
+    F["MFI14"] = (S["mfi"] - 50.0) / 25.0
+    F["CMF20"] = S["cmf"] * 4.0
+    F["OBV 动量"] = _safe(S["obv"] - S["obv_ma"], np.maximum(np.abs(S["obv_ma"]), 1.0)) * 10.0
+    F["VWAP 偏离"] = (c - S["vwap"]) / c / sg
+    F["量比×方向"] = np.sign(S["ret"]) * np.clip(S["volratio"], 0, 4) - np.sign(S["ret"])
+    F["力度指数"] = _safe(S["force"], np.maximum(sma(v, 20) * c * sg, 1.0))
+    for k, nm in ((1, "1"), (5, "5"), (20, "20")):
+        m = np.zeros(len(c))
+        if len(c) > k:
+            m[k:] = np.log(c[k:] / c[:-k])
+        F["动量%s" % nm] = m / (sg * math.sqrt(k))
+    for name in list(F):
+        F[name] = np.nan_to_num(np.clip(F[name], -6, 6), nan=0.0, posinf=0.0, neginf=0.0)
+    return F
+
+
+# ----------------------------- 最新值 + 规则投票 -----------------------------
+def _sg(v):
+    return 1 if v > 0 else (-1 if v < 0 else 0)
+
+
+def compute_all(bars):
+    """最新一根 K 线上的全部指标(含规则信号)。bars 至少 60 根。"""
+    if len(bars) < 60:
+        return {"ok": False, "reason": "K 线不足(%d<60)" % len(bars)}
+    S, B = build_series(bars)
+    c = B[:, 4]
+    i = len(c) - 1
+    px = float(c[i])
+    L = lambda k: float(S[k][i])  # noqa: E731
+    rows = []
+
+    def add(group, name, value, sig, note, fmt="%.2f"):
+        rows.append({"g": group, "name": name, "v": (fmt % value) if value is not None else "--", "raw": None if value is None else float(value),
+                     "sig": int(sig), "note": note})
+
+    # 趋势
+    add("趋势", "MA5/MA20", L("ma5") - L("ma20"), _sg(L("ma5") - L("ma20")), "MA5 在 MA20 之%s" % ("上" if L("ma5") > L("ma20") else "下"), "%+.4f")
+    add("趋势", "EMA8/EMA21", L("ema8") - L("ema21"), _sg(L("ema8") - L("ema21")), "短期趋势%s" % ("向上" if L("ema8") > L("ema21") else "向下"), "%+.4f")
+    add("趋势", "EMA21/EMA55", L("ema21") - L("ema55"), _sg(L("ema21") - L("ema55")), "中期趋势%s" % ("向上" if L("ema21") > L("ema55") else "向下"), "%+.4f")
+    add("趋势", "价格 vs EMA200", px - L("ema200"), _sg(px - L("ema200")), "价格在长期均线%s" % ("上方" if px > L("ema200") else "下方"), "%+.4f")
+    add("趋势", "MACD 柱", L("macd_hist"), _sg(L("macd_hist")), "MACD 柱为%s" % ("正" if L("macd_hist") > 0 else "负"), "%+.5f")
+    adx = L("adx")
+    add("趋势", "ADX(14)", adx, _sg(L("pdi") - L("mdi")) if adx >= 20 else 0, "趋势强度%s(+DI %.0f / -DI %.0f)" % ("强" if adx >= 25 else "弱", L("pdi"), L("mdi")), "%.1f")
+    add("趋势", "SuperTrend(10,3)", L("st_line"), L("st_dir"), "SuperTrend 方向%s" % ("多" if L("st_dir") > 0 else "空"), "%.3f")
+    add("趋势", "抛物线 SAR", L("sar"), L("sar_dir"), "SAR 在价格%s" % ("下方(多)" if L("sar_dir") > 0 else "上方(空)"), "%.3f")
+    add("趋势", "Aroon 振荡", L("aroon"), 1 if L("aroon") > 50 else (-1 if L("aroon") < -50 else 0), "Aroon %.0f" % L("aroon"), "%+.0f")
+    ct, cb = max(L("spana"), L("spanb")), min(L("spana"), L("spanb"))
+    add("趋势", "一目均衡表", px - (ct if px > ct else cb if px < cb else px), 1 if px > ct else (-1 if px < cb else 0),
+        "价格在云%s" % ("上" if px > ct else "下" if px < cb else "中"), "%+.3f")
+    add("趋势", "回归斜率 t(30)", L("linreg_t"), 1 if L("linreg_t") > 2 else (-1 if L("linreg_t") < -2 else 0), "对数价格线性回归 t=%.1f" % L("linreg_t"), "%+.1f")
+    # 动量 / 摆动
+    r6, r14, r24 = L("rsi6"), L("rsi14"), L("rsi24")
+    add("动量", "RSI(6)", r6, 1 if r6 < 20 else (-1 if r6 > 80 else 0), "超卖<20 / 超买>80", "%.1f")
+    add("动量", "RSI(14)", r14, 1 if r14 < 30 else (-1 if r14 > 70 else 0), "超卖<30 / 超买>70", "%.1f")
+    add("动量", "RSI(24)", r24, 1 if r24 < 35 else (-1 if r24 > 65 else 0), "超卖<35 / 超买>65", "%.1f")
+    add("动量", "StochRSI", L("stochrsi"), 1 if L("stochrsi") < 15 else (-1 if L("stochrsi") > 85 else 0), "StochRSI", "%.0f")
+    j = L("j")
+    add("动量", "KDJ(9,3,3) J", j, 1 if j < 0 else (-1 if j > 100 else 0), "K=%.0f D=%.0f J=%.0f" % (L("k"), L("d"), j), "%.0f")
+    add("动量", "威廉 %R(14)", L("willr"), 1 if L("willr") < -80 else (-1 if L("willr") > -20 else 0), "%R", "%.0f")
+    add("动量", "CCI(20)", L("cci"), 1 if L("cci") < -100 else (-1 if L("cci") > 100 else 0), "CCI", "%.0f")
+    add("动量", "ROC(12) %", L("roc12"), _sg(L("roc12")) if abs(L("roc12")) > 0.05 else 0, "12 根涨跌幅", "%+.2f")
+    add("动量", "TRIX(15) %", L("trix"), _sg(L("trix")), "TRIX 三重平滑动量", "%+.4f")
+    # 波动
+    add("波动", "布林 %B", L("bb_pctb"), 1 if L("bb_pctb") < 0.05 else (-1 if L("bb_pctb") > 0.95 else 0), "布林带内位置 %.0f%%" % (L("bb_pctb") * 100), "%.2f")
+    add("波动", "布林带宽", L("bb_bw") * 100, 0, "带宽%s(挤压后常有方向性突破)" % ("收窄" if S["bb_bw"][i] < np.percentile(S["bb_bw"][-120:], 20) else "正常"), "%.2f%%")
+    add("波动", "Keltner 通道", px - L("kc_up") if px > L("kc_up") else (px - L("kc_lo") if px < L("kc_lo") else 0.0),
+        -1 if px > L("kc_up") else (1 if px < L("kc_lo") else 0), "价格%s通道" % ("突破上沿" if px > L("kc_up") else "跌破下沿" if px < L("kc_lo") else "在"), "%+.3f")
+    add("波动", "唐奇安(20)位置", L("dc_pos") * 100, 1 if px >= L("dc_up") else (-1 if px <= L("dc_lo") else 0), "20 根区间位置(创新高/新低=突破)", "%.0f%%")
+    add("波动", "ATR(14) %", L("atr14") / px * 100, 0, "每根平均真实波幅", "%.3f%%")
+    add("波动", "已实现波动(20)", L("rv20") * 100, 0, "20 根收益标准差", "%.3f%%")
+    add("波动", "Z-score(20)", L("zscore20"), 1 if L("zscore20") < -2 else (-1 if L("zscore20") > 2 else 0), "偏离 20 根均值的标准差倍数", "%+.2f")
+    # 量价
+    add("量价", "MFI(14)", L("mfi"), 1 if L("mfi") < 20 else (-1 if L("mfi") > 80 else 0), "资金流量指数", "%.0f")
+    add("量价", "CMF(20)", L("cmf"), 1 if L("cmf") > 0.1 else (-1 if L("cmf") < -0.1 else 0), "钱德资金流", "%+.3f")
+    add("量价", "OBV 动量", L("obv") - L("obv_ma"), _sg(L("obv") - L("obv_ma")), "OBV 在其 EMA20 之%s" % ("上" if L("obv") > L("obv_ma") else "下"), "%+.0f")
+    add("量价", "VWAP 偏离", (px / L("vwap") - 1) * 100, _sg(px - L("vwap")), "价格在当日 VWAP %s" % ("上方" if px > L("vwap") else "下方"), "%+.3f%%")
+    add("量价", "量比", L("volratio"), 0, "当前量 / 20 根均量", "%.2f")
+    add("量价", "力度指数", L("force"), _sg(L("force")), "价量合力", "%+.0f")
+
+    votes = [r["sig"] for r in rows if r["sig"] != 0]
+    bull, bear = sum(1 for x in votes if x > 0), sum(1 for x in votes if x < 0)
+    trend_rows = [r["sig"] for r in rows if r["g"] == "趋势"]
+    mom_rows = [r["sig"] for r in rows if r["g"] == "动量"]
+    return {"ok": True, "n_bars": len(bars), "price": px, "rows": rows,
+            "vote": {"bull": bull, "bear": bear, "net": bull - bear, "total": len(rows),
+                     "trend_net": sum(trend_rows), "mom_net": sum(mom_rows)}}
+
+
+# ----------------------------- 样本外学习 -----------------------------
+def _corr(a, b):
+    if len(a) < 5 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def learn_weights(bars, H=6, cost_rt=0.0012, min_t=1.5):
+    """
+    对每个指标:训练段(前 70%)的 IC → 显著(|t|≥min_t)才保留,权重 = IC 的符号 × |IC|(自动判定"顺势"还是"逆势")。
+    复合分 = Σ w_i·z_i / Σ|w_i|。测试段(后 30%,中间留 H 根 embargo)不重叠抽样验证复合分的 IC、命中率、做多扣费净期望。
+    """
+    if len(bars) < 400:
+        return {"ok": False, "reason": "K 线不足(%d<400)" % len(bars)}
+    S, B = build_series(bars)
+    F = feature_dict(S, B)
+    c = B[:, 4]
+    lc = np.log(c)
+    n = len(c)
+    warm = 210 if n > 700 else 60
+    idx = np.arange(warm, n - H)
+    fwd = lc[idx + H] - lc[idx]
+    sig = np.maximum(S["rv20"][idx], 1e-6)
+    y = np.clip(fwd / (sig * math.sqrt(H)), -6, 6)
+    split = int(len(idx) * 0.7)
+    tr = np.arange(0, split - H)
+    te = np.arange(split, len(idx))
+    if len(tr) < 150 or len(te) < 60:
+        return {"ok": False, "reason": "可用样本过少"}
+    names = list(F)
+    # 标准化(仅用训练段统计量,避免泄漏)
+    Z = {}
+    for k in names:
+        x = F[k][idx]
+        mu, sd = x[tr].mean(), x[tr].std() + 1e-9
+        Z[k] = (x - mu) / sd
+    neff = max(10, len(tr) // H)  # 重叠收益的有效样本数
+    table, w = [], {}
+    for k in names:
+        ic = _corr(Z[k][tr], y[tr])
+        t = ic * math.sqrt(max(neff - 2, 1)) / math.sqrt(max(1 - ic * ic, 1e-9))
+        ic_te = _corr(Z[k][te][::H], y[te][::H])
+        keep = abs(t) >= min_t
+        if keep:
+            w[k] = ic
+        table.append({"name": k, "ic_train": ic, "t_train": float(t), "ic_test": ic_te, "kept": bool(keep),
+                      "dir": "顺势" if ic > 0 else "逆势"})
+    table.sort(key=lambda r: -abs(r["t_train"]))
+    out = {"ok": True, "H": H, "n_bars": n, "n_feat": len(names), "n_kept": len(w), "table": table[:24], "composite": None}
+    if not w:
+        out["reason"] = "训练段没有任何指标达到显著水平(|t|≥%.1f)——本标的当前没有可靠的指标优势" % min_t
+        return out
+    den = sum(abs(v) for v in w.values())
+    comp = sum(w[k] * Z[k] for k in w) / den
+    sel = np.arange(0, len(te), H)
+    ps, ys, fs = comp[te][sel], y[te][sel], fwd[te][sel]
+    ic = _corr(ps, ys)
+    ns = len(ps)
+    ic_t = ic * math.sqrt(max(ns - 2, 1)) / math.sqrt(max(1 - ic * ic, 1e-9))
+    nz = ys != 0
+    hit_n = int(nz.sum())
+    hit = float((np.sign(ps[nz]) == np.sign(ys[nz])).mean()) if hit_n else None
+    thr = 0.5 * float(np.std(comp[tr]))
+    lm = ps > thr
+    nets = fs[lm] - cost_rt
+    # 最新复合分(用全样本标准化统计量保持与训练一致:沿用训练段 mu/sd)
+    zl = 0.0
+    for k in w:
+        x = F[k][idx]
+        mu, sd = x[tr].mean(), x[tr].std() + 1e-9
+        zl += w[k] * (F[k][-1] - mu) / sd
+    zl /= den
+    contrib = sorted(((k, float(w[k] * (F[k][-1] - F[k][idx][tr].mean()) / (F[k][idx][tr].std() + 1e-9) / den)) for k in w), key=lambda z: -abs(z[1]))[:5]
+    out["composite"] = {
+        "now": float(zl), "now_pctile": float((comp[tr] < zl).mean()), "thr": thr,
+        "oos_n": int(ns), "oos_ic": ic, "oos_ic_t": float(ic_t), "oos_hit": hit,
+        "oos_long_n": int(lm.sum()), "oos_long_net_bp": float(nets.mean() * 1e4) if lm.sum() else 0.0,
+        "oos_long_win": float((nets > 0).mean()) if lm.sum() else None,
+        "reliable": bool(ic > 0 and hit is not None and hit >= 0.5), "significant": bool(ic_t >= 1.65),
+        "contrib": contrib, "weights": {k: float(v) for k, v in sorted(w.items(), key=lambda z: -abs(z[1]))[:12]},
+    }
+    return out
+
+
+def summary_text(allr, learned):
+    """给 LLM 的紧凑中文摘要(只含真实计算值)。"""
+    L = []
+    if allr and allr.get("ok"):
+        v = allr["vote"]
+        L.append("规则投票:看多%d / 看空%d / 共%d 项(趋势组净%+d, 动量组净%+d)" % (v["bull"], v["bear"], v["total"], v["trend_net"], v["mom_net"]))
+        strong = [r for r in allr["rows"] if r["sig"] != 0]
+        L.append("触发信号:" + ("; ".join("%s%s(%s)" % (r["name"], "多" if r["sig"] > 0 else "空", r["v"]) for r in strong[:14]) or "无"))
+        keyv = {r["name"]: r["v"] for r in allr["rows"]}
+        L.append("关键读数:RSI14=%s ADX=%s 布林%%B=%s MFI=%s CCI=%s ATR%%=%s VWAP偏离=%s" % (
+            keyv.get("RSI(14)"), keyv.get("ADX(14)"), keyv.get("布林 %B"), keyv.get("MFI(14)"), keyv.get("CCI(20)"), keyv.get("ATR(14) %"), keyv.get("VWAP 偏离")))
+    if learned and learned.get("ok"):
+        cp = learned.get("composite")
+        if cp:
+            L.append("学习复合分(从%d个指标中保留%d个训练段显著者, 预测未来%d根): 当前%+.2f(历史分位%.0f%%); 样本外IC=%+.3f(t=%.2f) 命中%s 做多扣费净期望%+.1fbp(n=%d,胜率%s); 主要贡献:%s; %s" % (
+                learned["n_feat"], learned["n_kept"], learned["H"], cp["now"], cp["now_pctile"] * 100, cp["oos_ic"], cp["oos_ic_t"],
+                "--" if cp["oos_hit"] is None else "%.1f%%" % (cp["oos_hit"] * 100), cp["oos_long_net_bp"], cp["oos_long_n"],
+                "--" if cp["oos_long_win"] is None else "%.0f%%" % (cp["oos_long_win"] * 100),
+                "、".join("%s%+.2f" % (a, b) for a, b in cp["contrib"][:4]),
+                "样本外可靠" if cp["reliable"] else "样本外不可靠(不应据此交易)"))
+        else:
+            L.append("学习复合分:" + learned.get("reason", "不可用"))
+    return "\n".join(L)
+'''
+
+REFLECT_PY = r'''"""
+反思引擎(Reflector)——让 AI "根据上一步操作复盘、独立思考、自我修正"。
+
+三层机制(都落盘,Kaggle 重启后可恢复):
+  1) 结果账本:每个 AI 决策到期后记录真实结果(净收益、最大有利/不利波动、是否扣费后盈利)。
+     每笔 AI 平仓也记录(盈亏、平仓原因、持有时长)。
+  2) 数值自适应(不依赖大模型,确定性):
+       - 置信度校准:把"模型自称的置信度"按分箱映射成真实命中率(带收缩),模型吹牛会被自动打折。
+       - 自适应门槛:最近 N 笔 BUY 的扣费后胜率低 -> 提高置信度/预期优势门槛;连亏 -> 冷静期。
+  3) 语言反思(大模型):把最近的"决策-理由-结果"喂给模型,让它指出错误模式并写出 ≤3 条可执行教训,
+     教训永久保存(最多 12 条),注入之后每一次决策的提示词。
+原则:反思只能让系统"更谨慎/更聚焦",不能绕过数学闸门。
+"""
+import json
+import math
+import threading
+import time
+
+BASE_MIN_CONF = 0.60
+BASE_EDGE_MULT = 1.5
+MAX_LESSONS = 12
+
+
+class Reflector:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.outcomes = []      # 决策到期结果
+        self.closes = []        # AI 平仓记录
+        self.lessons = []       # [{ts, text, src}]
+        self.reflect_count = 0
+        self.last_reflect_at = 0.0
+        self.settled_since = 0  # 自上次反思以来新增结果数
+        self.pause_until = 0.0
+        self.last_summary = ""
+
+    # ---------- 记录 ----------
+    def record_outcome(self, o):
+        """o: {ts, code, action, conf, strategy, p0, p1, ret, net, mfe, mae, horizon_min, thesis, factors, edge_bp, model}"""
+        with self.lock:
+            self.outcomes.append(o)
+            del self.outcomes[:-400]
+            self.settled_since += 1
+
+    def record_close(self, c):
+        """c: {ts, code, why, pnl, pnl_pct, hold_s, thesis}"""
+        with self.lock:
+            self.closes.append(c)
+            del self.closes[:-200]
+            self.settled_since += 1
+            tail = [x for x in self.closes[-3:]]
+            if len(tail) == 3 and all(x["pnl"] < 0 for x in tail):
+                self.pause_until = time.time() + 15 * 60  # 连亏 3 笔:冷静 15 分钟
+
+    # ---------- 数值自适应 ----------
+    def _buys(self, n=20):
+        return [o for o in self.outcomes if o["action"] == "BUY"][-n:]
+
+    def adapt(self):
+        """返回当前自适应门槛。"""
+        with self.lock:
+            b = self._buys(20)
+            n = len(b)
+            wr = (sum(1 for o in b if o["net"] > 0) / n) if n else None
+            min_conf, edge_mult, note = BASE_MIN_CONF, BASE_EDGE_MULT, "样本不足,使用基础门槛"
+            if n >= 8 and wr is not None:
+                if wr < 0.40:
+                    min_conf, edge_mult, note = 0.75, 2.2, "近%d笔 BUY 扣费后胜率 %.0f%% 偏低 → 收紧(置信≥0.75, 优势≥2.2×成本)" % (n, wr * 100)
+                elif wr < 0.48:
+                    min_conf, edge_mult, note = 0.68, 1.8, "近%d笔 BUY 扣费后胜率 %.0f%% 一般 → 略收紧" % (n, wr * 100)
+                elif wr > 0.60:
+                    min_conf, edge_mult, note = 0.58, 1.4, "近%d笔 BUY 扣费后胜率 %.0f%% 良好 → 略放宽" % (n, wr * 100)
+                else:
+                    note = "近%d笔 BUY 扣费后胜率 %.0f%% → 保持" % (n, wr * 100)
+            paused = time.time() < self.pause_until
+            return {"min_conf": min_conf, "edge_mult": edge_mult, "note": note, "n": n, "win_rate": wr,
+                    "paused": paused, "pause_left_s": max(0, int(self.pause_until - time.time()))}
+
+    def calibrate(self, conf):
+        """把模型自称置信度映射为经验命中率(分箱 + 向自称值收缩)。样本不足时返回原值。"""
+        with self.lock:
+            lo = math.floor(conf * 10) / 10.0
+            xs = [o for o in self.outcomes if o["action"] == "BUY" and lo <= o["conf"] < lo + 0.1 + 1e-9]
+            k = 8.0
+            n = len(xs)
+            if n == 0:
+                return conf, 0
+            hits = sum(1 for o in xs if o["net"] > 0)
+            return (hits + k * conf) / (n + k), n
+
+    def calib_table(self):
+        with self.lock:
+            rows = []
+            for lo in (0.5, 0.6, 0.7, 0.8, 0.9):
+                xs = [o for o in self.outcomes if o["action"] == "BUY" and lo <= o["conf"] < lo + 0.1 + 1e-9]
+                if xs:
+                    rows.append({"bin": "%.1f-%.1f" % (lo, lo + 0.1), "n": len(xs), "win": sum(1 for o in xs if o["net"] > 0) / len(xs),
+                                 "avg_net_bp": sum(o["net"] for o in xs) / len(xs) * 1e4})
+            return rows
+
+    # ---------- 语言反思 ----------
+    def need_reflection(self):
+        with self.lock:
+            return self.settled_since >= 3 and time.time() - self.last_reflect_at > 120
+
+    def reflection_prompt(self):
+        with self.lock:
+            items = sorted(self.outcomes[-12:] + [dict(x, action="CLOSE") for x in self.closes[-6:]], key=lambda x: x["ts"])[-14:]
+            lines = []
+            for x in items:
+                t = time.strftime("%m-%d %H:%M", time.gmtime(x["ts"] + 8 * 3600))
+                if x["action"] == "CLOSE":
+                    lines.append("- [%s] %s 平仓(%s) 盈亏¥%+.2f(%+.2f%%) 持有%d分钟;当初理由:%s" % (
+                        t, x["code"], x.get("why", ""), x["pnl"], x["pnl_pct"] * 100, x["hold_s"] // 60, (x.get("thesis") or "")[:60]))
+                else:
+                    lines.append("- [%s] %s 判断%s(置信%.2f,策略%s,持有%d分钟,预期优势%+.1fbp[%s]) 结果:收益%+.1fbp 扣费后%+.1fbp 最大有利%+.1fbp 最大不利%+.1fbp;理由:%s" % (
+                        t, x["code"], x["action"], x["conf"], x.get("strategy", ""), x.get("horizon_min", 0), x.get("edge_bp") or 0, x.get("model", ""),
+                        x["ret"] * 1e4, x["net"] * 1e4, x.get("mfe", 0) * 1e4, x.get("mae", 0) * 1e4, (x.get("thesis") or "")[:60]))
+            ad = self.adapt()
+            old = "\n".join("%d. %s" % (i + 1, l["text"]) for i, l in enumerate(self.lessons[-8:])) or "(暂无)"
+        return (
+            "你是这个量化模拟盘的【复盘官】。下面是 AI 最近的决策与真实结果(已扣除手续费与滑点)。请独立思考:\n"
+            "1) 哪些判断对了、为什么;哪些错了、错在数据解读还是风险控制(止损过紧/止盈过远/追涨/逆势/忽视成本)?\n"
+            "2) 有没有重复出现的错误模式?(例如:在 RSI 超买时追多、在低波动日试图赚取小于成本的利润)\n"
+            "3) 为了下一次决策更准,请写出最多 3 条【具体、可执行、可验证】的教训;不要空话,不要与已有教训重复,可以修订或推翻已有教训。\n\n"
+            "【最近决策与结果】\n%s\n\n【系统当前自适应状态】%s\n\n【已有教训】\n%s\n\n"
+            "仅输出 JSON:{\"verdict\":\"一句话总评(≤40字)\",\"mistakes\":[\"错误模式…\"],\"lessons\":[\"教训1\",\"教训2\"],\"drop\":[要作废的旧教训序号(整数,可空)]}"
+            % ("\n".join(lines) or "(暂无)", ad["note"], old))
+
+    def apply_reflection(self, d, src="LLM"):
+        """d: 解析后的 JSON。返回新增教训条数。"""
+        if not isinstance(d, dict):
+            return 0
+        added = 0
+        with self.lock:
+            drop = set()
+            for i in d.get("drop") or []:
+                try:
+                    drop.add(int(i) - 1)
+                except Exception:
+                    pass
+            base = len(self.lessons) - len(self.lessons[-8:])
+            if drop:
+                self.lessons = [l for j, l in enumerate(self.lessons) if (j - base) not in drop]
+            for tx in (d.get("lessons") or [])[:3]:
+                tx = str(tx).strip()[:160]
+                if len(tx) < 6 or any(tx == l["text"] for l in self.lessons):
+                    continue
+                self.lessons.append({"ts": time.time(), "text": tx, "src": src})
+                added += 1
+            del self.lessons[:-MAX_LESSONS]
+            self.last_summary = str(d.get("verdict", ""))[:80]
+            self.reflect_count += 1
+            self.last_reflect_at = time.time()
+            self.settled_since = 0
+        return added
+
+    def lessons_text(self):
+        with self.lock:
+            return "\n".join("%d. %s" % (i + 1, l["text"]) for i, l in enumerate(self.lessons[-8:]))
+
+    # ---------- 展示 / 持久化 ----------
+    def state(self):
+        with self.lock:
+            b = self._buys(40)
+            return {"lessons": [dict(l) for l in self.lessons[-8:]], "count": self.reflect_count, "last_at": int(self.last_reflect_at * 1000),
+                    "verdict": self.last_summary, "adapt": self.adapt(), "calib": self.calib_table(),
+                    "settled": len(self.outcomes), "closes": len(self.closes),
+                    "recent_win": (sum(1 for o in b if o["net"] > 0) / len(b)) if b else None, "recent_n": len(b)}
+
+    def export(self):
+        with self.lock:
+            return {"outcomes": self.outcomes[-400:], "closes": self.closes[-200:], "lessons": self.lessons, "reflect_count": self.reflect_count,
+                    "last_summary": self.last_summary}
+
+    def load(self, d):
+        if not isinstance(d, dict):
+            return
+        with self.lock:
+            self.outcomes = list(d.get("outcomes") or [])[-400:]
+            self.closes = list(d.get("closes") or [])[-200:]
+            self.lessons = list(d.get("lessons") or [])[-MAX_LESSONS:]
+            self.reflect_count = int(d.get("reflect_count") or 0)
+            self.last_summary = str(d.get("last_summary") or "")
+'''
+
+PERSIST_PY = r'''"""
+持久化与备份管理——保证重新打开 Kaggle、重新运行整个系统后,账户 / 持仓 / 成交日志 / AI 复盘与教训都还在。
+
+第一性原则:Kaggle 会话结束 = 本机磁盘消失,所以必须"写到会话之外"。三道保险:
+  1) 云备份(推荐):GitHub 私有 Gist(只需一个仅勾选 gist 权限的 Token;你本来就在用 GitHub)。
+       启动时自动按描述找到你的备份并恢复;运行中每次成交后 ~8 秒、平时每 60 秒(有变化时)自动上传。
+  2) 本地文件:/kaggle/working/quant_state.json(原子写入)。点 Kaggle『Save Version』后,它会成为 Notebook 的 Output;
+       下次把该 Output 作为 Input 挂载,启动时自动从 /kaggle/input/**/quant_state*.json 恢复。
+  3) 手动:页面右上角『导出』/『导入』按钮(下载/上传 JSON)。
+恢复时在所有来源里挑 saved_at 最新且有数据的一份。没有配置 Token 时,会明确提示"仅本会话有效"。
+"""
+import glob
+import hashlib
+import json
+import os
+import threading
+import time
+import urllib.request
+
+GIST_DESC = "lianghua-quant-state (auto backup)"
+GIST_FILE = "quant_state.json"
+UA = {"User-Agent": "lianghua-quant", "Accept": "application/vnd.github+json"}
+
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+
+class Persist:
+    def __init__(self, workdir, export_fn, import_fn):
+        self.dir = workdir
+        self.export_fn = export_fn
+        self.import_fn = import_fn
+        self.local_path = os.path.join(workdir, "quant_state.json")
+        self.token = (os.environ.get("QUANT_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN") or "").strip()
+        self.gist_id = (os.environ.get("QUANT_GIST_ID") or "").strip()
+        self.dirty = False
+        self.urgent_at = 0.0
+        self.last_hash = ""
+        self.lock = threading.RLock()
+        self.st = {"local": {"ok": False, "at": 0, "bytes": 0, "err": ""},
+                   "cloud": {"enabled": bool(self.token), "ok": False, "at": 0, "gist": self.gist_id, "err": "", "kind": "GitHub Gist"},
+                   "restored": {"from": "", "at": 0, "trades": 0, "detail": ""}}
+        self.wake = threading.Event()
+
+    # ---------- 工具 ----------
+    def _gh(self, method, path, body=None, timeout=20):
+        url = path if path.startswith("http") else "https://api.github.com" + path
+        h = dict(UA)
+        if self.token:
+            h["Authorization"] = "Bearer " + self.token
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            h["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=h, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+
+    def _raw(self, url):
+        h = dict(UA)
+        if self.token:
+            h["Authorization"] = "Bearer " + self.token
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=30) as r:
+            return r.read().decode("utf-8", "replace")
+
+    @staticmethod
+    def _digest(payload):
+        p = dict(payload)
+        p.pop("saved_at", None)
+        return hashlib.md5(json.dumps(p, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _score(p):
+        """有数据的备份才有恢复价值:成交数 + 决策数。"""
+        if not isinstance(p, dict):
+            return -1
+        return len((p.get("sql") or {}).get("trades") or []) + len((p.get("ai") or {}).get("decisions_log") or [])
+
+    # ---------- 云端 ----------
+    def _find_gist(self):
+        if self.gist_id:
+            return self.gist_id
+        for page in (1, 2, 3):
+            lst = self._gh("GET", "/gists?per_page=100&page=%d" % page)
+            for g in lst:
+                if g.get("description") == GIST_DESC:
+                    self.gist_id = g["id"]
+                    return self.gist_id
+            if len(lst) < 100:
+                break
+        return ""
+
+    def _cloud_load(self):
+        gid = self._find_gist()
+        if not gid:
+            return None
+        g = self._gh("GET", "/gists/" + gid)
+        f = (g.get("files") or {}).get(GIST_FILE)
+        if not f:
+            return None
+        txt = f.get("content") if not f.get("truncated") else self._raw(f["raw_url"])
+        return json.loads(txt)
+
+    def _cloud_save(self, text):
+        gid = self._find_gist()
+        if not gid:
+            g = self._gh("POST", "/gists", {"description": GIST_DESC, "public": False, "files": {GIST_FILE: {"content": text}}})
+            self.gist_id = g["id"]
+        else:
+            self._gh("PATCH", "/gists/" + gid, {"files": {GIST_FILE: {"content": text}}})
+        self.st["cloud"].update(gist=self.gist_id)
+
+    # ---------- 本地 / Kaggle input ----------
+    def _local_load(self):
+        cands = [self.local_path, os.path.join(self.dir, "quant_state.json")]
+        cands += glob.glob("/kaggle/input/**/quant_state*.json", recursive=True)
+        best, src = None, ""
+        for p in cands:
+            try:
+                with open(p, "r", encoding="utf-8") as fp:
+                    d = json.load(fp)
+                if self._score(d) >= 0 and (best is None or (d.get("saved_at", 0), self._score(d)) > (best.get("saved_at", 0), self._score(best))):
+                    best, src = d, p
+            except Exception:
+                continue
+        return best, src
+
+    def _local_save(self, text):
+        try:
+            os.makedirs(os.path.dirname(self.local_path), exist_ok=True)
+            tmp = self.local_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fp:
+                fp.write(text)
+            os.replace(tmp, self.local_path)
+            self.st["local"].update(ok=True, at=_now_ms(), bytes=len(text), err="")
+        except Exception as ex:
+            self.st["local"].update(ok=False, err=str(ex)[:120])
+
+    # ---------- 启动恢复 ----------
+    def boot_restore(self, db_fresh=True):
+        """所有来源里取 saved_at 最新且有数据者;返回描述字符串。
+        db_fresh=False(本机 SQLite 已有成交,更新鲜)时只恢复 AI 部分,不覆盖账户。"""
+        cands = []
+        d, src = self._local_load()
+        if d:
+            cands.append(("本地文件 " + src, d))
+        if self.token:
+            try:
+                c = self._cloud_load()
+                if c:
+                    cands.append(("GitHub Gist " + (self.gist_id or "")[:8], c))
+                self.st["cloud"].update(ok=True, err="")
+            except Exception as ex:
+                self.st["cloud"].update(ok=False, err="读取失败:%s" % str(ex)[:100])
+        cands = [x for x in cands if self._score(x[1]) > 0]
+        if not cands:
+            return "没有找到可恢复的历史数据(全新开始)"
+        cands.sort(key=lambda x: (x[1].get("saved_at", 0), self._score(x[1])), reverse=True)
+        name, payload = cands[0]
+        try:
+            self.import_fn(payload if db_fresh else {k: v for k, v in payload.items() if k != "sql"})
+            n = len((payload.get("sql") or {}).get("trades") or [])
+            self.st["restored"] = {"from": name, "at": _now_ms(), "trades": n, "detail": "已恢复账户/持仓/%d 笔成交/AI 复盘与教训" % n}
+            self.last_hash = self._digest(payload)
+            return "已从【%s】恢复:%d 笔成交" % (name, n)
+        except Exception as ex:
+            self.st["restored"] = {"from": name, "at": 0, "trades": 0, "detail": "恢复失败:%s" % ex}
+            return "恢复失败:%s" % ex
+
+    # ---------- 运行期 ----------
+    def mark_dirty(self, urgent=False):
+        self.dirty = True
+        if urgent:
+            self.urgent_at = time.time()
+            self.wake.set()
+
+    def save_now(self, force=False):
+        with self.lock:
+            payload = self.export_fn()
+            payload["saved_at"] = _now_ms()
+            payload["version"] = 2
+            h = self._digest(payload)
+            if h == self.last_hash and not force:
+                self.dirty = False
+                return {"changed": False}
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            self._local_save(text)
+            if self.token:
+                try:
+                    self._cloud_save(text)
+                    self.st["cloud"].update(ok=True, at=_now_ms(), err="")
+                except Exception as ex:
+                    self.st["cloud"].update(ok=False, err="上传失败:%s" % str(ex)[:100])
+                    return {"changed": True, "cloud": False}
+            self.last_hash = h
+            self.dirty = False
+            return {"changed": True, "cloud": bool(self.token)}
+
+    def _loop(self):
+        last_cloud = 0.0
+        while True:
+            self.wake.wait(5)
+            self.wake.clear()
+            try:
+                if not self.dirty:
+                    continue
+                urgent = time.time() - self.urgent_at < 9 and self.urgent_at > 0
+                if urgent and time.time() - self.urgent_at < 8:
+                    time.sleep(max(0, 8 - (time.time() - self.urgent_at)))
+                if time.time() - last_cloud >= (8 if self.urgent_at > last_cloud else 60):
+                    self.save_now()
+                    last_cloud = time.time()
+            except Exception:
+                pass
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def status(self):
+        s = json.loads(json.dumps(self.st))
+        s["dirty"] = self.dirty
+        s["tip"] = ("" if self.token else
+                    "未配置云备份:仅本会话/本地文件有效。请在 Kaggle 的 Add-ons→Secrets 添加 GITHUB_TOKEN(仅勾选 gist 权限),或在 Cell 1 顶部填写 GITHUB_TOKEN,重启后数据才不会丢失。")
+        return s
+'''
+
+for _name, _body in (("server.py", SERVER_PY), ("ai_engine.py", AI_PY), ("quant_math.py", MATH_PY), ("index.html", INDEX_HTML),
+                     ("indicators.py", INDICATORS_PY), ("reflect.py", REFLECT_PY), ("persist.py", PERSIST_PY)):
     with open(os.path.join(ROOT, _name), "w", encoding="utf-8") as f:
         f.write(_body)
 try:
@@ -2788,7 +4361,15 @@ subprocess.run("pkill -f '[q]uant/server.py'; pkill -f '[c]loudflared tunnel'; p
 time.sleep(1)
 
 # 2) 启动后端(行情轮询 + 模拟交易 + 网页)
-env = dict(os.environ, PORT=str(PORT), PYTHONUNBUFFERED="1")
+_tok = (GITHUB_TOKEN or os.environ.get("GITHUB_TOKEN") or "").strip()
+if not _tok:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        _tok = UserSecretsClient().get_secret("GITHUB_TOKEN").strip()
+    except Exception:
+        _tok = ""
+env = dict(os.environ, PORT=str(PORT), PYTHONUNBUFFERED="1", QUANT_GITHUB_TOKEN=_tok)
+print("☁ 云备份:", "已配置 GitHub Token(将自动备份/恢复到私有 Gist)" if _tok else "⚠ 未配置 GITHUB_TOKEN → 数据只在本次会话有效!(见本单元顶部说明)")
 server_log = open(os.path.join(ROOT, "server.log"), "w")
 server = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py")], env=env, cwd=ROOT,
                           stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -2810,6 +4391,10 @@ try:
     import json as _json
     _h = _json.load(urllib.request.urlopen("http://127.0.0.1:%d/api/health" % PORT, timeout=2))
     print("✔ AI 数学内核已加载" if _h.get("ai") else "⚠ AI 模块未加载(缺少 numpy?),规则策略仍可用")
+    _p = _json.load(urllib.request.urlopen("http://127.0.0.1:%d/api/persist" % PORT, timeout=2))
+    print("♻ 数据恢复:", (_p.get("restored") or {}).get("detail") or "未找到历史备份(全新开始)", "· 来源:", (_p.get("restored") or {}).get("from") or "-")
+    if (_p.get("cloud") or {}).get("err"):
+        print("⚠ 云备份读取问题:", _p["cloud"]["err"])
     try:
         urllib.request.urlopen("http://127.0.0.1:8001/v1/models", timeout=2).read()
         print("✔ 检测到大模型服务(Cell 0 已就绪),页面里可直接选『AI』模式")
