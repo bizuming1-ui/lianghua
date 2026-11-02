@@ -134,6 +134,11 @@ body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .
 #mbox{width:88vw;height:84vh;padding:1rem 1.2rem;display:flex;flex-direction:column;gap:.6rem;background:#04070b;border:1px solid #1b2738;border-radius:.7rem}
 #mbox .bar2{display:flex;gap:.6rem;align-items:center}
 #mtable{flex:1;min-height:0;overflow:hidden}
+.bkchip{cursor:pointer}.bkchip.ok{color:var(--txt);border-color:#1d3a2c}.bkchip.ok i{background:var(--dn)}.bkchip.bad{color:var(--warn);border-color:#4a3a14}.bkchip.bad i{background:var(--warn)}
+.sg{display:inline-block;padding:0 .35rem;border-radius:.25rem;font-size:.72rem}.sg.p{background:rgba(255,59,78,.15);color:var(--up)}.sg.n{background:rgba(25,195,125,.15);color:var(--dn)}.sg.z{color:var(--dim)}
+body[data-cc=us] .sg.p{background:rgba(25,195,125,.15);color:var(--up)}
+.ind2{width:100%;border-collapse:collapse;margin:.2rem 0 .6rem}.ind2 td,.ind2 th{padding:.12rem .5rem;text-align:left;font-size:.78rem;border-bottom:1px solid #0f1824;height:auto}
+.ind2 th{color:var(--dim);font-weight:400}
 </style>
 </head>
 <body data-cc="cn">
@@ -144,6 +149,10 @@ body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .
     <div class="sp"></div>
     <div id="feed"><i style="background:#555"></i><span>连接中…</span></div>
     <div class="chip mono" id="fx">USD/CNY --</div>
+    <span class="chip bkchip" id="bk" title="点击立即备份"><i></i><span>备份</span></span>
+    <button class="btn" id="bk_exp" title="下载全部数据(账户/持仓/成交日志/AI复盘)为 JSON">导出</button>
+    <button class="btn" id="bk_imp" title="从 JSON 备份恢复(会覆盖当前账户)">导入</button>
+    <input type="file" id="bk_file" accept=".json,application/json" style="display:none">
     <button class="btn" id="cc" title="切换红涨绿跌 / 绿涨红跌">红涨绿跌</button>
     <button class="btn danger" id="reset">重置账户</button>
     <div id="clock" class="mono">--:--:--</div>
@@ -222,7 +231,7 @@ body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .
           <div class="grp" id="gauto" title="自动交易模式:关闭 / 规则策略(1秒指标) / AI 推理策略(数学闸门+大模型)"><button class="btn" data-m="off">关闭</button><button class="btn" data-m="rule">规则</button><button class="btn" data-m="ai">AI</button></div></div>
         <div class="gpus" id="ai_gpu"></div>
         <div id="ai_body"></div>
-        <div class="aift"><button class="btn on" id="ai_run">立即分析</button><button class="btn" id="ai_more">推理详情</button></div>
+        <div class="aift"><button class="btn on" id="ai_run">立即分析</button><button class="btn" id="ai_ind" title="全部技术指标 + 样本外 IC 自适应加权">全部指标</button><button class="btn" id="ai_more">推理详情</button></div>
       </div>
     </aside>
   </div>
@@ -246,7 +255,7 @@ body[data-cc="us"] .tag.BUY{background:rgba(25,195,125,.16)}body[data-cc="us"] .
   </footer>
 </div>
 
-<div id="aimodal"><div id="aimbox"><div class="bar2"><b style="font-size:1.1rem">AI 推理详情 · 数学闸门 · 数据源</b><div class="sp"></div><button class="btn" id="aim_close">关闭</button></div><div id="aim_body"></div></div></div>
+<div id="aimodal"><div id="aimbox"><div class="bar2"><b style="font-size:1.1rem" id="aim_title">AI 推理详情 · 数学闸门 · 数据源</b><div class="sp"></div><button class="btn" id="aim_close">关闭</button></div><div id="aim_body"></div></div></div>
 
 <div id="modal"><div id="mbox">
   <div class="bar2"><b style="font-size:1.1rem">全部成交日志</b><span class="dim mono" id="m_info"></span><div class="sp"></div>
@@ -309,13 +318,13 @@ function apply(s) {
   S.prevPx = prev;
   for (const c in s.ticks) {
     const arr = (S.ticks[c] = S.ticks[c] || []);
-    for (const t of s.ticks[c]) if (!arr.length || t[0] > arr[arr.length - 1][0]) arr.push(t);
+    for (const t of s.ticks[c]) { if (!arr.length || t[0] > arr[arr.length - 1][0]) arr.push(t); else if (t[0] === arr[arr.length - 1][0]) arr[arr.length - 1][1] = t[1]; }
     if (arr.length > MAXT) arr.splice(0, arr.length - MAXT);
   }
   if (s.ticks) for (const c in S.ticks) { if (!s.ticks[c]) continue; }
   if (res !== "tick" && mode === "single") loadHist(sel, res);
-  S.q = s.quotes; S.sig = s.signals; S.acct = s.account; S.pos = s.positions; S.stats = s.stats; S.trades = s.trades; S.fx = s.fx; S.feed = s.feed; S.now = s.ts;
-  renderAll();
+  S.q = s.quotes; S.sig = s.signals; S.acct = s.account; S.pos = s.positions; S.stats = s.stats; S.trades = s.trades; S.fx = s.fx; S.feed = s.feed; S.now = s.ts; S.fee = s.fee; S.persist = s.persist;
+  renderAll(); renderBackup();
 }
 
 /* ---------------- 渲染 ---------------- */
@@ -332,7 +341,7 @@ function renderHeader() {
   let h;
   if (anySim) h = '<i style="background:#f5b942"></i><span style="color:#f5b942">模拟行情(外网不可用,仅演示)</span>';
   else if (anyStale || !f.ok) h = '<i style="background:#f5b942"></i><span style="color:#f5b942">行情延迟 · ' + (f.error || "stale") + "</span>";
-  else h = '<i style="background:#19c37d;box-shadow:0 0 .5rem #19c37d"></i><span>实时 · ' + f.name + " · " + f.latency + "ms · 1秒刷新</span>";
+  else h = '<i style="background:#19c37d;box-shadow:0 0 .5rem #19c37d"></i><span>实时 · ' + f.name + " · " + f.latency + "ms · " + (fastOn && S.fastAt && Date.now() - S.fastAt < 1500 ? "毫秒级刷新(" + (f.pollMs || 500) + "ms 抓取/200ms 推送)" : "1秒刷新") + "</span>";
   $("feed").innerHTML = h;
   $("fx").textContent = "USD/CNY " + S.fx.rate.toFixed(4) + (S.fx.src === "default" ? " (兜底)" : "");
 }
@@ -412,7 +421,8 @@ function renderTrade() {
   $("t_sym").textContent = q.code; $("t_lot").textContent = "最小单位 " + q.lot;
   const qty = parseInt($("qty").value, 10) || 0;
   const amt = q.price * qty * fxOf(q);
-  $("t_est").textContent = "预计 " + money(amt * 1.0003).replace("+", "") + (q.currency === "USD" ? " (" + CUR.USD + (q.price * qty).toFixed(2) + ")" : "");
+  const fr = S.fee || { flat: 5, below: 10000, rate: 0.0005 }, fee1 = amt <= 0 ? 0 : (amt < fr.below ? fr.flat : amt * fr.rate);
+  $("t_est").textContent = "预计 " + money(amt + fee1).replace("+", "") + " (含手续费¥" + fee1.toFixed(2) + ")" + (q.currency === "USD" ? " " + CUR.USD + (q.price * qty).toFixed(2) : "");
   const p = S.pos.find((x) => x.symbol === sel);
   $("t_pos").textContent = "持仓 " + (p ? p.qty : 0);
 }
@@ -752,6 +762,8 @@ function renderAI() {
   gp.innerHTML = (st.gpus || []).map((g) => '<div class="gpu"><span>GPU' + g.i + "</span><div class='gb'><div style='width:" + Math.min(100, g.util) + "%'></div></div><b class='mono'>" + Math.round(g.util) + "%</b><span class='dim mono'>" + (g.memUsed / 1024).toFixed(1) + "/" + (g.memTotal / 1024).toFixed(0) + "G</span></div>").join("") || '<div class="dim">未检测到 GPU</div>';
   const lv = st.live && st.live[sel], d = st.decisions && st.decisions[sel], s = st.studies && st.studies[sel];
   let h = "";
+  const br = st.brain;
+  if (br && llm.up) h += '<div class="dim" style="font-size:.68rem">🧠 推理占空比 <b class="mono ' + (br.duty > 0.8 ? "dn2" : "warn") + '">' + (br.duty * 100).toFixed(0) + "%</b>(近2分钟,双卡TP同步) · " + esc(br.task) + " · " + br.samples + " 次自洽投票</div>";
   if (!llm.up) h += '<div class="warn">大模型未就绪:请先在 Kaggle 运行 Cell 0(双 T4 部署),就绪后此处自动变绿。</div>';
   if (lv && lv.running) h += '<div class="think"><b class="acc">AI 正在推理…</b> <span class="mono dim">' + lv.tokens + " tokens</span><div class='tt'>" + esc((lv.tail || "").slice(-380)) + "</div></div>";
   if (d) {
@@ -760,6 +772,7 @@ function renderAI() {
       const fin = d.finalAction;
       h += '<div class="dec"><span class="sig ' + fin + '">' + ACT[fin] + "</span> <span class='dim'>AI原判 " + ACT[d.action] + " · 置信 <b class='mono'>" + (d.confidence * 100).toFixed(0) + "%</b> · " + esc(d.strategy) + " · 持有≤" + d.horizonMin + "分 · 止损" + d.stopPct + "% 止盈" + d.targetPct + "%</span></div>";
       h += '<div class="thesis">' + esc(d.thesis) + "</div>";
+      if (d.votes) h += '<div class="stl">投票 ' + Object.entries(d.votes.tally).map(([k, v]) => ACT[k] + v).join(" / ") + (d.confCal != null ? " · 校准后置信 " + (d.confCal * 100).toFixed(0) + "%" : "") + "</div>";
       const bad = (d.gate.checks || []).filter((c) => !c.ok);
       h += '<div class="gate ' + (d.gate.pass ? "pass" : "fail") + '">数学闸门 ' + (d.gate.pass ? "✔ 通过" : "✘ 拦截:" + bad.slice(0, 2).map((c) => esc(c.name)).join(" / ")) + (d.exec ? " · " + esc(d.exec) : "") + "</div>";
       h += '<div class="dim" style="font-size:.66rem">' + fmtT(d.ts) + " · 耗时 " + d.latencyS + "s · " + d.tokens + " tokens</div>";
@@ -770,6 +783,10 @@ function renderAI() {
     if (s.gap && s.gap.expected_remaining != null) h += "<div class='stl'>隔夜联动 β=" + s.gap.beta.toFixed(2) + " (t=" + s.gap.t.toFixed(1) + ", R²=" + s.gap.r2.toFixed(2) + ") 剩余预期 <b class='mono " + cls(s.gap.expected_remaining) + "'>" + (s.gap.expected_remaining * 100).toFixed(2) + "%</b></div>";
   }
   const sc = st.score; if (sc && sc.n) h += '<div class="dim" style="font-size:.66rem">AI复盘 ' + sc.n + " 条 · BUY命中 " + (sc.buy_rate == null ? "--" : (sc.buy_rate * 100).toFixed(0) + "%") + " · 净 " + (sc.avg_net_bp == null ? "--" : sc.avg_net_bp.toFixed(1) + "bp") + "</div>";
+  const rf = st.reflect;
+  if (rf) { h += '<div class="stl">🔁 已反思 ' + rf.count + " 次 · 教训 " + rf.lessons.length + " 条 · " + esc(rf.adapt.note) + (rf.adapt.paused ? " · 冷静期 " + rf.adapt.pause_left_s + "s" : "") + "</div>"; if (rf.lessons.length) h += '<div class="stl" style="color:#9fb2cc">最新教训:' + esc(rf.lessons[rf.lessons.length - 1].text) + "</div>"; }
+  const ib = st.ind && st.ind[sel] && st.ind[sel]["5m"];
+  if (ib) h += '<div class="stl">5分钟指标投票 多' + ib.vote.bull + "/空" + ib.vote.bear + (ib.comp ? " · 学习复合分 " + ib.comp.now.toFixed(2) + (ib.comp.reliable ? " 样本外可靠" : " 样本外不可靠") : "") + "</div>";
   body.innerHTML = h;
 }
 $("gauto").addEventListener("click", async (e) => {
@@ -784,6 +801,15 @@ async function openAI() {
     const st = await (await fetch("/api/ai/state?full=1", { cache: "no-store" })).json();
     if (!st.available) { box.innerHTML = '<div class="dim">' + esc(st.reason) + "</div>"; return; }
     let h = "";
+    $("aim_title").textContent = "AI 推理详情 · 数学闸门 · 数据源"; $("aim_body").dataset.kind = "ai";
+    const rf = st.reflect;
+    if (rf) {
+      h += "<h3>🔁 反思与自我进化 <span class='dim'>(已复盘 " + rf.settled + " 个决策结果 / " + rf.closes + " 笔平仓;反思 " + rf.count + " 次)</span></h3><div class='dim'>" + esc(rf.adapt.note) + " · 当前门槛:置信度≥" + rf.adapt.min_conf + "、预期优势≥" + rf.adapt.edge_mult + "×成本</div>";
+      if (rf.verdict) h += "<div class='thesis'>最近总评:" + esc(rf.verdict) + "</div>";
+      h += "<div>" + (rf.lessons.length ? rf.lessons.map((l, i) => (i + 1) + ". " + esc(l.text)).join("<br>") : "<span class='dim'>暂无教训:需要至少 3 个已结算的决策/平仓才会触发第一次反思。</span>") + "</div>";
+      if (rf.calib && rf.calib.length) h += "<div class='dim'>置信度校准:" + rf.calib.map((c) => c.bin + " → 实际胜率 " + (c.win * 100).toFixed(0) + "%(n=" + c.n + ", 净 " + c.avg_net_bp.toFixed(0) + "bp)").join(" · ") + "</div>";
+    }
+    if (st.briefing && st.briefing.text) h += "<h3>🌐 AI 宏观简报</h3><div>" + esc(st.briefing.text) + "</div>";
     for (const c of Object.keys(st.decisions || {})) {
       const d = st.decisions[c]; if (d.error) { h += "<h3>" + c + " · 失败:" + esc(d.error) + "</h3>"; continue; }
       h += "<h3>" + c + " · " + ACT[d.finalAction] + " <span class='dim'>(AI原判 " + ACT[d.action] + " · 置信 " + (d.confidence * 100).toFixed(0) + "% · " + fmtDT(d.ts) + ")</span></h3>";
@@ -800,8 +826,85 @@ $("ai_more").onclick = openAI;
 $("aim_close").onclick = () => $("aimodal").classList.remove("on");
 
 setInterval(() => { $("clock").textContent = fmtT(Date.now()); }, 250);
+
+/* ---------------- 毫秒级报价层:/api/fast 每 200ms 一次(几百字节),价格变化即刻重绘 ---------------- */
+let fastOn = true, rq = false;
+function scheduleRender() { if (rq || !S.acct) return; rq = true; requestAnimationFrame(() => { rq = false; renderCards(); renderCenter(); renderTrade(); drawMain(); }); }
+async function fastLoop() {
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/api/fast", { cache: "no-store" });
+    if (!r.ok) throw new Error("no fast");
+    const f = await r.json();
+    let changed = false;
+    S.q.forEach((q) => {
+      const a = f.q[q.code]; if (!a) return;
+      if (a[0] !== q.price || a[4] !== q.quoteTime) {
+        S.prevPx = S.prevPx || {}; S.prevPx[q.code] = q.price;
+        q.price = a[0]; q.prevClose = a[1]; q.high = a[2]; q.low = a[3]; q.quoteTime = a[4]; q.feed = a[5];
+        q.change = q.price - q.prevClose; q.pct = q.prevClose > 0 ? (q.price / q.prevClose - 1) * 100 : null;
+        const arr = S.ticks[q.code]; if (arr && arr.length) arr[arr.length - 1][1] = q.price;
+        changed = true;
+      }
+    });
+    S.fastAt = Date.now();
+    if (S.feed) { S.feed.latency = f.lat; S.feed.pollMs = f.pollMs; }
+    if (changed) scheduleRender();
+  } catch (e) { fastOn = false; return; } // Next 版没有 /api/fast:自动退回 1 秒轮询
+  setTimeout(fastLoop, Math.max(60, 200 - (performance.now() - t0)));
+}
+
+/* ---------------- 备份 / 恢复 ---------------- */
+function renderBackup() {
+  const p = S.persist, el = $("bk");
+  ["bk", "bk_exp", "bk_imp"].forEach((id) => ($(id).style.display = p ? "" : "none"));
+  if (!p) return;
+  const c = p.cloud, l = p.local, ago = (t) => (t ? Math.max(0, Math.round((Date.now() - t) / 1000)) + "秒前" : "未保存");
+  let txt, ok;
+  if (c.enabled) { ok = c.ok; txt = ok ? "☁ 云备份 " + ago(c.at) : "☁ 云备份异常"; } else { ok = false; txt = "💾 仅本会话(未配云备份)"; }
+  el.className = "chip bkchip " + (ok ? "ok" : "bad"); el.querySelector("span").textContent = txt;
+  el.title = [p.tip, c.err && "云端:" + c.err, l.ok ? "本地快照 " + ago(l.at) + "(" + (l.bytes / 1024).toFixed(0) + "KB)" : "", p.restored && p.restored.from ? "启动时已恢复自:" + p.restored.from + "(" + p.restored.detail + ")" : "", "点击立即备份"].filter(Boolean).join("\n");
+}
+$("bk").onclick = async () => { try { const j = await (await fetch("/api/persist/save", { method: "POST" })).json(); say(j.ok ? (j.changed === false ? "数据无变化,备份已是最新" : j.cloud ? "✔ 已备份到本地并上传云端" : "✔ 已备份到本地(未配置云端)") : "✘ " + (j.error || "备份失败"), !!j.ok); } catch (e) { say("✘ 备份失败", false); } };
+$("bk_exp").onclick = () => { location.href = "/api/backup"; };
+$("bk_imp").onclick = () => $("bk_file").click();
+$("bk_file").onchange = async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  if (!confirm("导入会覆盖当前账户 / 持仓 / 成交日志,确定吗?")) { e.target.value = ""; return; }
+  try { const j = await (await fetch("/api/restore", { method: "POST", headers: { "Content-Type": "application/json" }, body: await f.text() })).json(); say(j.ok ? "✔ 已恢复 " + j.trades + " 笔成交" : "✘ " + (j.error || "导入失败"), !!j.ok); } catch (er) { say("✘ 文件无效", false); }
+  e.target.value = "";
+};
+
+/* ---------------- 全部指标面板 ---------------- */
+let indTf = "5m";
+const sgl = (v) => (v > 0 ? '<span class="sg p">看多</span>' : v < 0 ? '<span class="sg n">看空</span>' : '<span class="sg z">中性</span>');
+async function openInd(tf) {
+  if (tf) indTf = tf;
+  $("aimodal").classList.add("on"); $("aim_title").textContent = "全部指标 · " + sel + " · " + indTf;
+  const box = $("aim_body"); box.dataset.kind = "ind"; box.innerHTML = '<div class="dim">计算中…</div>';
+  const tabs = '<div style="display:flex;gap:.3rem;margin-bottom:.5rem">' + ["1m", "5m", "15m", "1d"].map((t) => '<button class="btn ' + (t === indTf ? "on" : "") + '" data-t="' + t + '">' + t + "</button>").join("") + "</div>";
+  try {
+    const j = await (await fetch("/api/indicators?code=" + sel + "&tf=" + indTf, { cache: "no-store" })).json();
+    if (!j.ok) { box.innerHTML = tabs + '<div class="warn">' + esc(j.error || "指标不可用(仅 Kaggle 后端提供;或 K 线不足)") + "</div>"; return; }
+    const a = j.all, v = a.vote, L = j.learned || {};
+    let h = tabs + "<div>规则投票:多 <b class='up'>" + v.bull + "</b> / 空 <b class='dn'>" + v.bear + "</b> / 共 " + v.total + " 项 · 趋势组净 " + v.trend_net + " · 动量组净 " + v.mom_net + " · K线 " + a.n_bars + " 根 · 来源 " + esc(j.src || "?") + " · 价格 " + a.price.toFixed(3) + "</div>";
+    h += "<h3>样本外学习(只信数据:训练段显著的指标才加权,测试段验证)</h3>";
+    const cp = L.composite;
+    if (cp) h += "<div>从 " + L.n_feat + " 个指标中保留 <b>" + L.n_kept + "</b> 个(训练段 |t|≥1.5)。复合分当前 <b class='mono'>" + cp.now.toFixed(2) + "</b>(历史分位 " + (cp.now_pctile * 100).toFixed(0) + "%)· 样本外 IC <b class='mono'>" + cp.oos_ic.toFixed(3) + "</b>(t=" + cp.oos_ic_t.toFixed(2) + ")· 命中 " + (cp.oos_hit == null ? "--" : (cp.oos_hit * 100).toFixed(1) + "%") + " · 做多扣费净期望 " + cp.oos_long_net_bp.toFixed(1) + "bp(n=" + cp.oos_long_n + ") · " + (cp.reliable ? '<span class="dn2">样本外可靠</span>' : '<span class="warn">样本外不可靠:不应据此交易</span>') + "</div><div class='dim'>主要贡献:" + cp.contrib.map((x) => esc(x[0]) + (x[1] > 0 ? "+" : "") + x[1].toFixed(2)).join(" · ") + "</div>";
+    else h += '<div class="warn">' + esc(L.reason || "不可用") + "</div>";
+    if (L.table && L.table.length) h += "<table class='ind2'><tr><th>指标</th><th>训练 IC</th><th>t</th><th>测试 IC</th><th>方向</th><th>采用</th></tr>" + L.table.slice(0, 14).map((r) => "<tr class='mono'><td>" + esc(r.name) + "</td><td>" + r.ic_train.toFixed(3) + "</td><td>" + r.t_train.toFixed(2) + "</td><td>" + r.ic_test.toFixed(3) + "</td><td>" + r.dir + "</td><td>" + (r.kept ? "✔" : "—") + "</td></tr>").join("") + "</table>";
+    for (const g of ["趋势", "动量", "波动", "量价"]) {
+      h += "<h3>" + g + "指标</h3><table class='ind2'><tr><th>指标</th><th>数值</th><th>信号</th><th>说明</th></tr>" + a.rows.filter((r) => r.g === g).map((r) => "<tr><td>" + esc(r.name) + "</td><td class='mono'>" + esc(r.v) + "</td><td>" + sgl(r.sig) + "</td><td class='dim'>" + esc(r.note) + "</td></tr>").join("") + "</table>";
+    }
+    box.innerHTML = h;
+  } catch (e) { box.innerHTML = tabs + '<div class="warn">读取失败(此后端没有指标接口)</div>'; }
+}
+$("aim_body").addEventListener("click", (e) => { const b = e.target.closest("button[data-t]"); if (b) openInd(b.dataset.t); });
+$("ai_ind").onclick = () => openInd();
+
 loop();
 aiLoop();
+fastLoop();
 </script>
 </body>
 </html>
