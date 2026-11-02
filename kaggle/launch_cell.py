@@ -7,6 +7,12 @@
 # ==========================================================================
 import os, sys, re, time, subprocess, urllib.request
 
+# ★ 数据永久保存(强烈建议配置,否则 Kaggle 重开后账户/成交/AI 复盘会丢):
+#   到 https://github.com/settings/tokens 新建 classic token,只勾选 gist 权限,填在下面;
+#   或在 Kaggle Notebook 菜单 Add-ons → Secrets 添加名为 GITHUB_TOKEN 的密钥(推荐,不会泄露到代码里)。
+#   系统会自动在你的 GitHub 建一个【私有 Gist】保存备份,下次启动自动找回。
+GITHUB_TOKEN = ""
+
 ROOT = os.environ.get("QUANT_ROOT", "/kaggle/working/quant")
 PORT = int(os.environ.get("QUANT_PORT", "8000"))
 os.makedirs(ROOT, exist_ok=True)
@@ -19,7 +25,14 @@ MATH_PY = r'''__MATH_PY__'''
 
 INDEX_HTML = r'''__INDEX_HTML__'''
 
-for _name, _body in (("server.py", SERVER_PY), ("ai_engine.py", AI_PY), ("quant_math.py", MATH_PY), ("index.html", INDEX_HTML)):
+INDICATORS_PY = r'''__INDICATORS_PY__'''
+
+REFLECT_PY = r'''__REFLECT_PY__'''
+
+PERSIST_PY = r'''__PERSIST_PY__'''
+
+for _name, _body in (("server.py", SERVER_PY), ("ai_engine.py", AI_PY), ("quant_math.py", MATH_PY), ("index.html", INDEX_HTML),
+                     ("indicators.py", INDICATORS_PY), ("reflect.py", REFLECT_PY), ("persist.py", PERSIST_PY)):
     with open(os.path.join(ROOT, _name), "w", encoding="utf-8") as f:
         f.write(_body)
 try:
@@ -33,7 +46,15 @@ subprocess.run("pkill -f '[q]uant/server.py'; pkill -f '[c]loudflared tunnel'; p
 time.sleep(1)
 
 # 2) 启动后端(行情轮询 + 模拟交易 + 网页)
-env = dict(os.environ, PORT=str(PORT), PYTHONUNBUFFERED="1")
+_tok = (GITHUB_TOKEN or os.environ.get("GITHUB_TOKEN") or "").strip()
+if not _tok:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        _tok = UserSecretsClient().get_secret("GITHUB_TOKEN").strip()
+    except Exception:
+        _tok = ""
+env = dict(os.environ, PORT=str(PORT), PYTHONUNBUFFERED="1", QUANT_GITHUB_TOKEN=_tok)
+print("☁ 云备份:", "已配置 GitHub Token(将自动备份/恢复到私有 Gist)" if _tok else "⚠ 未配置 GITHUB_TOKEN → 数据只在本次会话有效!(见本单元顶部说明)")
 server_log = open(os.path.join(ROOT, "server.log"), "w")
 server = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py")], env=env, cwd=ROOT,
                           stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -55,6 +76,10 @@ try:
     import json as _json
     _h = _json.load(urllib.request.urlopen("http://127.0.0.1:%d/api/health" % PORT, timeout=2))
     print("✔ AI 数学内核已加载" if _h.get("ai") else "⚠ AI 模块未加载(缺少 numpy?),规则策略仍可用")
+    _p = _json.load(urllib.request.urlopen("http://127.0.0.1:%d/api/persist" % PORT, timeout=2))
+    print("♻ 数据恢复:", (_p.get("restored") or {}).get("detail") or "未找到历史备份(全新开始)", "· 来源:", (_p.get("restored") or {}).get("from") or "-")
+    if (_p.get("cloud") or {}).get("err"):
+        print("⚠ 云备份读取问题:", _p["cloud"]["err"])
     try:
         urllib.request.urlopen("http://127.0.0.1:8001/v1/models", timeout=2).read()
         print("✔ 检测到大模型服务(Cell 0 已就绪),页面里可直接选『AI』模式")
