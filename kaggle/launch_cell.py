@@ -1,5 +1,6 @@
 # ==========================================================================
-#  生物科技ETF 量化终端 · Kaggle 一键启动(Cell 1)
+#  生物科技ETF 量化终端 + AI 推理决策 · Kaggle 一键启动(Cell 1)
+#  建议顺序:先运行 Cell 0(双 T4 部署大模型),再运行本单元;没有 Cell 0 时仍可用规则策略
 #  使用前提:Notebook 右侧 Settings → Internet 必须是 ON(行情和公网网址都需要联网)
 #  运行后:下方会打印一个 https://xxxx.trycloudflare.com 网址,点开就是量化终端
 #  说明:服务以后台进程运行,本单元运行完即返回;会话不关闭,网站就一直在线
@@ -12,12 +13,19 @@ os.makedirs(ROOT, exist_ok=True)
 
 SERVER_PY = r'''__SERVER_PY__'''
 
+AI_PY = r'''__AI_PY__'''
+
+MATH_PY = r'''__MATH_PY__'''
+
 INDEX_HTML = r'''__INDEX_HTML__'''
 
-with open(os.path.join(ROOT, "server.py"), "w", encoding="utf-8") as f:
-    f.write(SERVER_PY)
-with open(os.path.join(ROOT, "index.html"), "w", encoding="utf-8") as f:
-    f.write(INDEX_HTML)
+for _name, _body in (("server.py", SERVER_PY), ("ai_engine.py", AI_PY), ("quant_math.py", MATH_PY), ("index.html", INDEX_HTML)):
+    with open(os.path.join(ROOT, _name), "w", encoding="utf-8") as f:
+        f.write(_body)
+try:
+    import numpy  # AI 数学内核依赖(Kaggle 自带)
+except Exception:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "numpy"])
 print("✔ 文件已写入", ROOT)
 
 # 1) 清理旧进程(方括号写法避免 pkill 误杀自身所在的 shell)
@@ -27,7 +35,7 @@ time.sleep(1)
 # 2) 启动后端(行情轮询 + 模拟交易 + 网页)
 env = dict(os.environ, PORT=str(PORT), PYTHONUNBUFFERED="1")
 server_log = open(os.path.join(ROOT, "server.log"), "w")
-server = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py")], env=env,
+server = subprocess.Popen([sys.executable, os.path.join(ROOT, "server.py")], env=env, cwd=ROOT,
                           stdout=server_log, stderr=subprocess.STDOUT, start_new_session=True)
 ok = False
 for _ in range(60):
@@ -43,6 +51,17 @@ if not ok:
     print(open(os.path.join(ROOT, "server.log")).read())
     raise SystemExit("✘ 后端启动失败,请把上面的日志发给我")
 print("✔ 后端已启动: http://127.0.0.1:%d" % PORT)
+try:
+    import json as _json
+    _h = _json.load(urllib.request.urlopen("http://127.0.0.1:%d/api/health" % PORT, timeout=2))
+    print("✔ AI 数学内核已加载" if _h.get("ai") else "⚠ AI 模块未加载(缺少 numpy?),规则策略仍可用")
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8001/v1/models", timeout=2).read()
+        print("✔ 检测到大模型服务(Cell 0 已就绪),页面里可直接选『AI』模式")
+    except Exception:
+        print("ℹ 尚未检测到大模型服务:请先运行 Cell 0(双 T4 部署),再刷新页面使用『AI』模式")
+except Exception:
+    pass
 
 # 联网自检:新浪行情源
 try:
