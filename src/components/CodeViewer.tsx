@@ -142,10 +142,10 @@ export default function CodeViewer({ pack }: { pack: CodePack }) {
           <>
             <div>1. 打开 Kaggle → New Notebook → 右侧 Settings:<b className="text-amber-300">Accelerator 选 GPU T4 ×2</b>,<b className="text-amber-300">Internet 设为 ON</b>。</div>
             <div>
-              2. 先复制 <b className="text-fuchsia-400">Cell 0</b> 粘贴运行(首次约 8~20 分钟:安装 vLLM、下载 Qwen3-14B-AWQ、加载到两张卡),结尾出现 <code className="rounded bg-[#0b1226] px-1.5">✅ 两张 T4 同时工作</code> 即成功。
+              2. 先复制 <b className="text-fuchsia-400">Cell 0</b> 粘贴运行(首次约 8~20 分钟:安装 vLLM、下载 Qwen3-32B-AWQ(失败自动降级 14B)、加载到两张卡),结尾出现 <code className="rounded bg-[#0b1226] px-1.5">✅ 两张 T4 同时工作</code> 即成功。
             </div>
             <div>
-              3. 再新建一个单元,复制 <b className="text-emerald-400">Cell 1</b> 运行,输出 <code className="rounded bg-[#0b1226] px-1.5">https://xxxx.trycloudflare.com</code> 就是量化终端网址;页面右侧 AI 面板点「AI」即启用。Cell 2 可随时查看双卡利用率。
+              3. 再新建一个单元,复制 <b className="text-emerald-400">Cell 1</b> 运行,输出 <code className="rounded bg-[#0b1226] px-1.5">https://xxxx.trycloudflare.com</code> 就是量化终端网址;页面右侧 AI 面板点「AI」即启用。Cell 2 可随时查看双卡利用率。<br />4. <b className="text-amber-300">数据永久保存:</b>在 Kaggle 菜单 Add-ons → Secrets 添加 <code className="rounded bg-[#0b1226] px-1.5">GITHUB_TOKEN</code>(GitHub classic token,仅勾选 gist 权限)。之后账户 / 持仓 / 成交日志 / AI 复盘教训会自动备份到你的私有 Gist,重开 Kaggle 重新运行 Cell 1 会自动恢复;页面右上角也有「导出 / 导入」按钮手动备份。
             </div>
           </>
         )}
